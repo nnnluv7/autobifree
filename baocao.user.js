@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         AutoBaoCaoFree
+// @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
 // @version      1.5
 // @description  Báo Cáo Kinh Doanh
-// @author       Bi
+// @author       AeNhaQuang
 // @homepageURL  https://github.com/nnnluv7/autobi.free
 // @match        https://crm.thegioididong.com/*
 // @match        https://baocao.dienmayxanh.com/*
