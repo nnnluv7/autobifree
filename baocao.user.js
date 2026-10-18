@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.6.3
+// @version      1.6.4
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -381,7 +381,8 @@
         ['Phụ kiện - Đồng hồ', ['Phụ kiện tiện ích khác', 'Wearable', 'Camera', 'Pin sạc dự phòng', 'Phụ kiện trang trí', 'Tai nghe', 'Đồng hồ thời trang', 'Loa vi tính']],
         ['Máy lạnh & Máy nước nóng', ['Máy lạnh', 'Máy nước nóng']]
     ];
-    const fixedId = name => 'fixed:' + slug(name);
+    // The Laptop group has a different meaning from the former industry total.
+    const fixedId = name => slug(name) === 'laptop' ? 'fixed:laptop-group' : 'fixed:' + slug(name);
     const parentNames = new Map(families.flatMap(([parent, children]) => children.map(name => [name, parent])));
     const fixedRows = FIXED_NAMES.map(name => Object.freeze({ id: fixedId(name), name, parentId: parentNames.has(name) ? fixedId(parentNames.get(name)) : '', depth: parentNames.has(name) ? 1 : 0 }));
     const fixedById = new Map(fixedRows.map(row => [row.id, row]));
@@ -522,17 +523,50 @@
         return result;
     }
 
+    function matchingRow(part, spec, kind = 'industry') {
+        const items = part?.items || {};
+        let matches = Object.values(items).filter(row => slug(row.name) === slug(spec.name));
+        if (spec.id === 'fixed:laptop-group' && kind !== 'group') {
+            matches = matches.filter(row => row.parentId || row.depth > 0 || /(?:^|:)g-/.test(row.id));
+        }
+        if (matches.length < 2) return { row: matches[0], ambiguous: false };
+        if (spec.id !== 'fixed:laptop-group') return { row: null, ambiguous: true };
+        const contains = (ancestor, child) => {
+            const seen = new Set([child.id]);
+            let parentId = child.parentId;
+            while (parentId && !seen.has(parentId)) {
+                if (parentId === ancestor.id) return true;
+                seen.add(parentId);
+                parentId = items[parentId]?.parentId;
+            }
+            return false;
+        };
+        // If labels repeat inside the selected level, keep one common ancestor once.
+        const parents = matches.filter(row => matches.every(other => row.id === other.id || contains(row, other)));
+        return parents.length === 1 ? { row: parents[0], ambiguous: false } : { row: null, ambiguous: true };
+    }
+
     function fixedPart(source) {
-        const raw = Object.values(source.items || {}), items = {};
+        const items = {}, selections = new Map(), sourceIds = new Map();
         let complete = source.complete;
         for (const spec of fixedRows) {
-            const matches = raw.filter(row => slug(row.name) === slug(spec.name));
-            const same = matches.length < 2;
-            if (!same) complete = false;
-            const match = matches[0];
-            const parent = match && fixedByName.get(slug(source.items[match.parentId]?.name || ''));
-            items[spec.id] = { ...spec, ...(match ? { code: match.code, sourceId: match.id, parentId: parent?.id || '', depth: parent ? 1 : 0 } : {}),
-                metrics: match && same ? clone(match.metrics) : source.complete && !match ? zero() : Object.fromEntries(metrics.map(key => [key, null])) };
+            const selected = matchingRow(source, spec);
+            selections.set(spec.id, selected);
+            if (selected.row) sourceIds.set(selected.row.id, spec.id);
+            if (selected.ambiguous) complete = false;
+        }
+        for (const spec of fixedRows) {
+            const { row: match, ambiguous } = selections.get(spec.id);
+            let parentId = '', sourceParent = match?.parentId;
+            const seen = new Set(match ? [match.id] : []);
+            while (sourceParent && !seen.has(sourceParent)) {
+                seen.add(sourceParent);
+                const selectedParent = sourceIds.get(sourceParent);
+                if (selectedParent && selectedParent !== spec.id) { parentId = selectedParent; break; }
+                sourceParent = source.items?.[sourceParent]?.parentId;
+            }
+            items[spec.id] = { ...spec, ...(match ? { code: match.code, sourceId: match.id, parentId, depth: parentId ? 1 : 0 } : {}),
+                metrics: match ? clone(match.metrics) : source.complete && !ambiguous ? zero() : Object.fromEntries(metrics.map(key => [key, null])) };
         }
         return { complete, items, total: source.total, expanded: source.expanded };
     }
@@ -544,11 +578,11 @@
         // Older daily snapshots separated industry/group; match the exact normalized label once.
         for (const kind of kinds) {
             const part = store[kind];
-            const matches = Object.values(part?.items || {}).filter(row => slug(row.name) === slug(spec.name));
-            if (matches.length === 1) return matches[0].metrics;
-            if (matches.length > 1) return null;
+            const { row, ambiguous } = matchingRow(part, spec, kind);
+            if (row) return row.metrics;
+            if (ambiguous) return null;
             const catalog = Object.values(snapshot.catalog?.[kind]?.items || {}).find(row => slug(row.name) === slug(spec.name));
-            if (catalog && part?.complete) return zero();
+            if (catalog && part?.complete && spec.id !== 'fixed:laptop-group') return zero();
         }
         return kinds.every(kind => store[kind]?.complete) ? zero() : null;
     }
