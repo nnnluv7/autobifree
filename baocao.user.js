@@ -2,8 +2,8 @@
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
 // @version      1.4.2
-// @description  AeNhaQuang
-// @author       Bi
+// @description  Báo Cáo Kinh Doanh
+// @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
 // @match        https://baocao.dienmayxanh.com/*
 // @include      https://baocao.dienmayxanh.com/*
