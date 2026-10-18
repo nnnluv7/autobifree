@@ -371,7 +371,6 @@
         'Tai nghe', 'Đồng hồ thời trang', 'Loa vi tính', 'Máy lạnh & Máy nước nóng',
         'Máy lạnh', 'Máy nước nóng', 'Laptop', 'IT', 'Avapos', 'Sim DATA',
         'Giao dịch AirTime', 'Thẻ cào điện tử', 'VAS'
-]);
     ]);
     const families = [
         ['Apple', ['iPhone', 'Phụ kiện Apple']],
