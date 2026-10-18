@@ -370,9 +370,8 @@
         'Phụ kiện tiện ích khác', 'Wearable', 'Camera', 'Pin sạc dự phòng', 'Phụ kiện trang trí',
         'Tai nghe', 'Đồng hồ thời trang', 'Loa vi tính', 'Máy lạnh & Máy nước nóng',
         'Máy lạnh', 'Máy nước nóng', 'Laptop', 'IT', 'Avapos', 'Sim DATA',
-        'Giao dịch AirTime', 'Thẻ cào điện tử', 'VAS', 'CHƯA PHÂN LOẠI', 'Software (số Lượng)',
-        'Dịch vụ bảo hành 1 đổi 1 bởi Điện Máy Xanh', 'Phụ kiện máy hút bụi',
-        'NH Tận Tâm', 'Phụ kiện lắp đặt', 'Dịch vụ'
+        'Giao dịch AirTime', 'Thẻ cào điện tử', 'VAS'
+]);
     ]);
     const families = [
         ['Apple', ['iPhone', 'Phụ kiện Apple']],
@@ -381,8 +380,7 @@
         ['Viễn thông di động', ['Smartphone']], ['Điện tử', ['Tivi', 'Loa']],
         ['Tủ lạnh, đông, mát', ['Tủ lạnh', 'Tủ mát', 'Tủ đông']],
         ['Phụ kiện - Đồng hồ', ['Phụ kiện tiện ích khác', 'Wearable', 'Camera', 'Pin sạc dự phòng', 'Phụ kiện trang trí', 'Tai nghe', 'Đồng hồ thời trang', 'Loa vi tính']],
-        ['Máy lạnh & Máy nước nóng', ['Máy lạnh', 'Máy nước nóng']],
-        ['NH Tận Tâm', ['Phụ kiện lắp đặt', 'Dịch vụ']]
+        ['Máy lạnh & Máy nước nóng', ['Máy lạnh', 'Máy nước nóng']]
     ];
     const fixedId = name => 'fixed:' + slug(name);
     const parentNames = new Map(families.flatMap(([parent, children]) => children.map(name => [name, parent])));
@@ -825,7 +823,7 @@
         for (const shop of shops) {
             snapshot.stores[shop.id] = {};
             try {
-                ui.showToast('Đang lấy 46 nhóm hàng: ' + shop.short, 0);
+                ui.showToast('Đang lấy 39 nhóm hàng: ' + shop.short, 0);
                 await driver.selectShops([shop]);
                 if (!await driver.switchDimension('industry')) throw new Error('Không mở được Ngành hàng BI.');
                 const industry = await driver.crawl('industry', { fixedOnly: true });
@@ -1005,12 +1003,12 @@
         const splitAt = FIXED_NAMES.indexOf('Phụ kiện - Đồng hồ');
         const first = rows[0];
         const right = first?.querySelector('.sk-col-right');
-        if (right) right.innerHTML = tableHTML('NHÓM HÀNG THEO DÕI · 1–20 / 46', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode, entries.slice(0, splitAt)), view.date, view.previous, view.mode);
+        if (right) right.innerHTML = tableHTML('NHÓM HÀNG THEO DÕI · 1–20 / 39', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode, entries.slice(0, splitAt)), view.date, view.previous, view.mode);
         rows.slice(1).forEach(row => row.remove());
         const second = doc.createElement('div');
         second.className = 'sk-macro-row';
         second.style.borderTop = '2px solid #000';
-        second.innerHTML = `<div class="sk-col-left health-bi-pies">${pieHTML(view.snapshot, view.before, scope, view.shops, view.mode, 'Tỷ trọng tháng này')}${pieHTML(view.old, view.beforePrevious, scope, view.shops, view.mode, 'Tỷ trọng tháng trước')}</div><div class="sk-col-right">${tableHTML('NHÓM HÀNG THEO DÕI · 21–46 / 46', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode, entries.slice(splitAt)), view.date, view.previous, view.mode)}</div>`;
+        second.innerHTML = `<div class="sk-col-left health-bi-pies">${pieHTML(view.snapshot, view.before, scope, view.shops, view.mode, 'Tỷ trọng tháng này')}${pieHTML(view.old, view.beforePrevious, scope, view.shops, view.mode, 'Tỷ trọng tháng trước')}</div><div class="sk-col-right">${tableHTML('NHÓM HÀNG THEO DÕI · 21–46 / 39', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode, entries.slice(splitAt)), view.date, view.previous, view.mode)}</div>`;
         container.appendChild(second);
         const date = container.querySelector('.sk-date');
         if (date) {
@@ -1020,7 +1018,7 @@
         const hint = doc.createElement('div');
         hint.className = 'health-bi-note';
         const partial = kinds.some(kind => !view.snapshot?.catalog?.[kind]?.complete);
-        hint.textContent = !cfg.historySheetId ? 'Khai báo ID Google Sheet lịch sử để lưu và đối chiếu theo ngày.' : historyErrors.get(String(cfg.historySheetId).trim()) || (!view.old ? 'Chưa có bản lưu ngày ' + displayDate(view.previous) + ' để đối chiếu.' : partial ? 'Một phần dữ liệu chưa xác minh xong; vẫn giữ đủ 46 nhóm theo dõi.' : '46 nhóm cố định · Đối chiếu cùng ngày tháng trước · Số 0 là dữ liệu hợp lệ.');
+        hint.textContent = !cfg.historySheetId ? 'Khai báo ID Google Sheet lịch sử để lưu và đối chiếu theo ngày.' : historyErrors.get(String(cfg.historySheetId).trim()) || (!view.old ? 'Chưa có bản lưu ngày ' + displayDate(view.previous) + ' để đối chiếu.' : partial ? 'Một phần dữ liệu chưa xác minh xong; vẫn giữ đủ 39 nhóm theo dõi.' : '39 nhóm cố định · Đối chiếu cùng ngày tháng trước · Số 0 là dữ liệu hợp lệ.');
         container.appendChild(hint);
         const style = doc.createElement('style');
         style.textContent = `
