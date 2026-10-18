@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.6.0
+// @version      1.6.1
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -361,6 +361,35 @@
     const nativeButtons = () => Array.from(document.querySelectorAll('button')).filter(native);
     const zero = () => ({ sl: 0, dtqd: 0, dtthuc: 0, dttragop: 0 });
     const metrics = ['sl', 'dtqd', 'dtthuc', 'dttragop'];
+    const FIXED_MODE = 'fixed-46-v1';
+    const FIXED_NAMES = Object.freeze([
+        'Apple', 'iPhone', 'Phụ kiện Apple', 'Máy giặt, sấy', 'Máy giặt', 'Máy rửa chén',
+        'Gia dụng', 'Điện gia dụng', 'Máy lọc nước', 'Gia dụng lắp đặt', 'Dụng cụ nhà bếp',
+        'Viễn thông di động', 'Smartphone', 'Điện tử', 'Tivi', 'Loa',
+        'Tủ lạnh, đông, mát', 'Tủ lạnh', 'Tủ mát', 'Tủ đông', 'Phụ kiện - Đồng hồ',
+        'Phụ kiện tiện ích khác', 'Wearable', 'Camera', 'Pin sạc dự phòng', 'Phụ kiện trang trí',
+        'Tai nghe', 'Đồng hồ thời trang', 'Loa vi tính', 'Máy lạnh & Máy nước nóng',
+        'Máy lạnh', 'Máy nước nóng', 'Laptop', 'IT', 'Avapos', 'Sim DATA',
+        'Giao dịch AirTime', 'Thẻ cào điện tử', 'VAS', 'CHƯA PHÂN LOẠI', 'Software (số Lượng)',
+        'Dịch vụ bảo hành 1 đổi 1 bởi Điện Máy Xanh', 'Phụ kiện máy hút bụi',
+        'NH Tận Tâm', 'Phụ kiện lắp đặt', 'Dịch vụ'
+    ]);
+    const families = [
+        ['Apple', ['iPhone', 'Phụ kiện Apple']],
+        ['Máy giặt, sấy', ['Máy giặt', 'Máy rửa chén']],
+        ['Gia dụng', ['Điện gia dụng', 'Máy lọc nước', 'Gia dụng lắp đặt', 'Dụng cụ nhà bếp']],
+        ['Viễn thông di động', ['Smartphone']], ['Điện tử', ['Tivi', 'Loa']],
+        ['Tủ lạnh, đông, mát', ['Tủ lạnh', 'Tủ mát', 'Tủ đông']],
+        ['Phụ kiện - Đồng hồ', ['Phụ kiện tiện ích khác', 'Wearable', 'Camera', 'Pin sạc dự phòng', 'Phụ kiện trang trí', 'Tai nghe', 'Đồng hồ thời trang', 'Loa vi tính']],
+        ['Máy lạnh & Máy nước nóng', ['Máy lạnh', 'Máy nước nóng']],
+        ['NH Tận Tâm', ['Phụ kiện lắp đặt', 'Dịch vụ']]
+    ];
+    const fixedId = name => 'fixed:' + slug(name);
+    const parentNames = new Map(families.flatMap(([parent, children]) => children.map(name => [name, parent])));
+    const fixedRows = FIXED_NAMES.map(name => Object.freeze({ id: fixedId(name), name, parentId: parentNames.has(name) ? fixedId(parentNames.get(name)) : '', depth: parentNames.has(name) ? 1 : 0 }));
+    const fixedById = new Map(fixedRows.map(row => [row.id, row]));
+    const fixedByName = new Map(fixedRows.map(row => [slug(row.name), row]));
+    const rowName = value => String(value || '').replace(/^[+−]\s*/, '').replace(/^\d+\s*[-–:]\s*/, '').trim();
     const historyBySheet = new Map();
     const loadingHistory = new Set();
     const loadedHistory = new Set();
@@ -496,8 +525,35 @@
         return result;
     }
 
-    function mergeCatalog(previous, discovered, complete) {
-        return complete ? clone(discovered) : { ...clone(previous || {}), ...clone(discovered) };
+    function fixedPart(source) {
+        const raw = Object.values(source.items || {}), items = {};
+        let complete = source.complete;
+        for (const spec of fixedRows) {
+            const matches = raw.filter(row => slug(row.name) === slug(spec.name));
+            const same = matches.length < 2;
+            if (!same) complete = false;
+            const match = matches[0];
+            const parent = match && fixedByName.get(slug(source.items[match.parentId]?.name || ''));
+            items[spec.id] = { ...spec, ...(match ? { code: match.code, sourceId: match.id, parentId: parent?.id || '', depth: parent ? 1 : 0 } : {}),
+                metrics: match && same ? clone(match.metrics) : source.complete && !match ? zero() : Object.fromEntries(metrics.map(key => [key, null])) };
+        }
+        return { complete, items, total: source.total, expanded: source.expanded };
+    }
+
+    function fixedMetric(snapshot, shopId, spec) {
+        const store = snapshot.stores?.[shopId];
+        if (!store) return null;
+        if (snapshot.catalogMode === FIXED_MODE) return store.industry?.items?.[spec.id]?.metrics || null;
+        // Older daily snapshots separated industry/group; match the exact normalized label once.
+        for (const kind of kinds) {
+            const part = store[kind];
+            const matches = Object.values(part?.items || {}).filter(row => slug(row.name) === slug(spec.name));
+            if (matches.length === 1) return matches[0].metrics;
+            if (matches.length > 1) return null;
+            const catalog = Object.values(snapshot.catalog?.[kind]?.items || {}).find(row => slug(row.name) === slug(spec.name));
+            if (catalog && part?.complete) return zero();
+        }
+        return kinds.every(kind => store[kind]?.complete) ? zero() : null;
     }
 
     function metricFor(snapshot, scope, kind, id, shops) {
@@ -508,7 +564,7 @@
         for (const shop of requested) {
             const part = snapshot.stores?.[shop.id]?.[kind];
             if (!part) return null;
-            const value = id === '__total__' ? part.total : part.items?.[id]?.metrics || (part.complete ? zero() : null);
+            const value = id === '__total__' ? part.total : fixedById.has(id) ? fixedMetric(snapshot, shop.id, fixedById.get(id)) : part.items?.[id]?.metrics || (part.complete ? zero() : null);
             if (!value) return null;
             for (const metric of metrics) {
                 if (value[metric] == null) result[metric] = null;
@@ -536,7 +592,7 @@
         return Number.isFinite(num) && /\d/.test(str) ? num : null;
     }
 
-    function readPage(kind, table, stack = []) {
+    function readPage(kind, table, stack = [], typedKeys = false) {
         const headers = Array.from(table.querySelectorAll('thead th, thead td')).map(text);
         const names = headers.map(slug);
         const labelIndex = Math.max(0, names.findIndex(name => /nganhhang|nhomhang/.test(name)));
@@ -564,7 +620,8 @@
             const code = label.match(/^(\d+)\s*[-–:]\s*/)?.[1] || raw.replace(/^[pgc]-/, '');
             label = label.replace(/^\d+\s*[-–:]\s*/, '').trim();
             const parentId = depth > 0 ? stack[depth - 1] || '' : '';
-            const id = kind + ':' + (code || 'name-' + hash(parentId + ':' + slug(label)));
+            const identity = typedKeys && /^[pgc]-/.test(raw) ? raw : code;
+            const id = kind + ':' + (identity || 'name-' + hash(parentId + ':' + slug(label)));
             stack[depth] = id;
             stack.length = depth + 1;
             const ok = value.sl != null && value.dtqd != null;
@@ -615,7 +672,7 @@
         return false;
     }
 
-    async function crawl(kind) {
+    async function crawl(kind, options = {}) {
         const items = {}, clicked = new Set(), pages = new Set();
         let total = null, complete = true, expanded = false, stack = [];
         const deadline = Date.now() + 120000;
@@ -634,12 +691,14 @@
             if (!await quiet()) { complete = false; break; }
             const table = tableElement();
             if (!table) { complete = false; break; }
-            const page = readPage(kind, table, stack);
+            const page = readPage(kind, table, stack, options.fixedOnly);
             stack = page.stack;
             Object.assign(items, page.items);
             if (page.total) total = page.total;
-            if (!page.valid || page.badCells) { complete = false; break; }
-            const collapsed = Array.from(table.querySelectorAll('button.ant-table-row-expand-icon-collapsed, button[aria-expanded="false"], [role="button"][aria-expanded="false"]')).filter(visible);
+            const badCells = options.fixedOnly ? Object.values(page.items).some(row => fixedByName.has(slug(row.name)) && (row.metrics.sl == null || row.metrics.dtqd == null)) : page.badCells;
+            if (!page.valid || badCells) { complete = false; break; }
+            const collapsed = Array.from(table.querySelectorAll('button.ant-table-row-expand-icon-collapsed, button[aria-expanded="false"], [role="button"][aria-expanded="false"]')).filter(visible).filter(button =>
+                !options.fixedOnly || fixedByName.has(slug(rowName(text(button.closest('tr')?.querySelector('td'))))));
             const fresh = collapsed.filter(button => {
                 const row = button.closest('tr');
                 return row && !clicked.has(row.getAttribute('data-row-key') || text(row.querySelector('td')));
@@ -746,115 +805,7 @@
         if (!await quiet()) throw new Error('Dữ liệu chưa tải xong cho siêu thị đã chọn.');
     }
 
-    function derivedGroups(industry) {
-        const items = {};
-        for (const row of Object.values(industry.items || {})) if (row.depth > 0) {
-            const id = row.id.replace(/^industry:/, 'group:');
-            items[id] = { ...clone(row), id, parentId: row.parentId.replace(/^industry:/, 'group:'), depth: Math.max(0, row.depth - 1) };
-        }
-        for (const item of Object.values(items)) if (!items[item.parentId]) item.parentId = '';
-        return { items, total: industry.total, complete: industry.complete && industry.expanded, derived: true };
-    }
-
-    function catalogFrom(snapshot, kind) {
-        const items = {};
-        for (const shop of snapshot.shops) for (const row of Object.values(snapshot.stores[shop.id]?.[kind]?.items || {})) {
-            const { metrics: ignored, ...metadata } = row;
-            items[row.id] = metadata;
-        }
-        return items;
-    }
-
-    async function readCatalog(kind) {
-        const accepted = kind === 'industry' ? ['nganhhang', 'nganhhangbi'] : ['nhomhang', 'nhomhangbi'];
-        const matches = button => Array.from(button.querySelectorAll('span')).some(span => accepted.includes(slug(text(span))));
-        const trigger = nativeButtons().find(button => button.classList.contains('filter-field-card') && matches(button)) ||
-            nativeButtons().find(button => matches(button) && !accepted.includes(slug(text(button))));
-        if (!trigger) return { items: {}, complete: false };
-        const items = {}, clicked = new Set();
-        let complete = true, opened = false;
-        const options = () => Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(nativeOption);
-        const panelRoot = () => {
-            const inputs = options();
-            if (!inputs.length) return null;
-            let node = inputs[0].parentElement;
-            let common = null;
-            while (node && node !== document.body) {
-                if (!common && inputs.every(input => node.contains(input))) common = node;
-                if (['absolute', 'fixed'].includes(getComputedStyle(node).position)) return node;
-                node = node.parentElement;
-            }
-            return common;
-        };
-        const scrollBox = () => {
-            let node = options()[0]?.parentElement;
-            while (node && node !== document.body) {
-                if (node.clientHeight > 0 && node.scrollHeight > node.clientHeight + 8 && node.querySelectorAll('input[type="checkbox"]').length > 1) return node;
-                node = node.parentElement;
-            }
-            return null;
-        };
-        try {
-            trigger.click(); opened = true;
-            await sleep(350);
-            const box = scrollBox();
-            if (box) { box.scrollTop = 0; await sleep(200); }
-            const deadline = Date.now() + 60000;
-            for (let turn = 0; turn < 500; turn++) {
-                if (Date.now() > deadline || turn === 499) { complete = false; break; }
-                for (const option of options()) {
-                    const row = option.closest('label, [role="treeitem"], [role="option"]') || option.parentElement;
-                    const label = text(row);
-                    if (!label || /^(?:bo)?chontatca$/.test(slug(label))) continue;
-                    const name = label.replace(/^\d+\s*[-–:]\s*/, '').trim();
-                    const code = label.match(/^(\d+)\s*[-–:]\s*/)?.[1] || (/^\d+$/.test(option.value || '') ? option.value : '');
-                    const id = kind + ':' + (code || 'name-' + hash(':' + slug(name)));
-                    items[id] = { id, code, name, parentId: '', depth: 0 };
-                }
-                const panel = panelRoot();
-                const expand = Array.from(panel?.querySelectorAll('button[aria-expanded="false"], [role="button"][aria-expanded="false"], .ant-tree-switcher_close') || []).filter(el =>
-                    native(el) && !el.classList.contains('filter-field-card') && !el.closest('table, .report-table, .ant-table-content') && !clicked.has(el));
-                if (expand.length) {
-                    for (const el of expand.slice(0, 12)) { clicked.add(el); el.click(); }
-                    await sleep(400);
-                    continue;
-                }
-                const search = Array.from(document.querySelectorAll('input')).filter(native).find(input => /timkiem|search/.test(slug(input.placeholder || '')) && input.value);
-                if (search) complete = false;
-                const scroll = scrollBox();
-                if (!scroll || scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 4) break;
-                const before = scroll.scrollTop;
-                scroll.scrollTop += scroll.clientHeight * .7;
-                scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
-                if (scroll.scrollTop <= before) { complete = false; break; }
-                await sleep(250);
-            }
-            if (!Object.keys(items).length || busy()) complete = false;
-        } catch (_) { complete = false; }
-        finally { if (opened) trigger.click(); }
-        return { items, complete };
-    }
-
-    function alignPart(part, catalog, kind) {
-        if (!part) return;
-        const rawItems = part.items || {};
-        const entries = Object.values(catalog.items || {}), remap = {}, excluded = new Set();
-        for (const row of Object.values(part.items || {})) {
-            const candidates = entries.filter(item => (row.code && item.code === row.code) || slug(item.name) === slug(row.name));
-            if (candidates.length === 1) remap[row.id] = candidates[0].id;
-            else if (kind === 'industry' && catalog.complete && row.depth > 0 && !catalog.items[row.id]) excluded.add(row.id);
-            else if (!catalog.items[row.id]) catalog.complete = false;
-        }
-        part.items = Object.fromEntries(Object.values(part.items || {}).filter(row => !excluded.has(row.id)).map(row => {
-            const id = remap[row.id] || row.id;
-            let parentId = row.parentId;
-            const seen = new Set();
-            while (excluded.has(parentId) && !seen.has(parentId)) { seen.add(parentId); parentId = rawItems[parentId]?.parentId || ''; }
-            return [id, { ...row, id, parentId: remap[parentId] || parentId }];
-        }));
-    }
-
-    const driver = { selectShops, switchDimension, crawl, readCatalog };
+    const driver = { selectShops, switchDimension, crawl };
 
     function catalogKey(cfg) {
         return 'autobi_health_bi_catalog_v1:' + hash(String(cfg.historySheetId || '') + ':' + shopList(cfg).map(shop => shop.id).sort().join(','));
@@ -862,43 +813,37 @@
 
     async function collectSnapshot(cfg) {
         const shops = shopList(cfg), date = reportDate();
-        const snapshot = { version: VERSION, date, sheetId: String(cfg.historySheetId || '').trim(), capturedAt: new Date().toISOString(), shops, stores: {}, catalog: {}, notes: [] };
+        const snapshot = { version: VERSION, catalogMode: FIXED_MODE, date, sheetId: String(cfg.historySheetId || '').trim(), capturedAt: new Date().toISOString(), shops, stores: {}, catalog: {}, notes: [] };
         if (!shops.length || !date) throw new Error('Cần khai báo siêu thị và tháng báo cáo hợp lệ.');
-        const historyPromise = loadHistory(cfg);
+        loadHistory(cfg);
         await new Promise(resolve => {
             let once = false;
             const finish = () => { if (!once) { once = true; resolve(); } };
             setTimeout(finish, 15000);
             data.switchAndEnsureTabDMX('Lũy kế', finish);
         });
-        const authoritative = {};
-        for (const kind of kinds) authoritative[kind] = await driver.readCatalog(kind);
         for (const shop of shops) {
             snapshot.stores[shop.id] = {};
             try {
-                ui.showToast('Đang lấy BI: ' + shop.short, 0);
+                ui.showToast('Đang lấy 46 nhóm hàng: ' + shop.short, 0);
                 await driver.selectShops([shop]);
                 if (!await driver.switchDimension('industry')) throw new Error('Không mở được Ngành hàng BI.');
-                const industry = await driver.crawl('industry');
-                snapshot.stores[shop.id].industry = industry;
-                snapshot.stores[shop.id].group = await driver.switchDimension('group')
-                    ? await driver.crawl('group') : derivedGroups(industry);
-                for (const kind of kinds) alignPart(snapshot.stores[shop.id][kind], authoritative[kind], kind);
+                const industry = await driver.crawl('industry', { fixedOnly: true });
+                snapshot.stores[shop.id].industry = fixedPart(industry);
+                snapshot.stores[shop.id].group = { complete: industry.complete, items: {}, total: industry.total };
+                if (!snapshot.stores[shop.id].industry.complete) snapshot.notes.push(shop.short + ': chưa xác minh xong dữ liệu nhóm hàng.');
             } catch (error) {
                 snapshot.notes.push(shop.short + ': ' + error.message);
             }
         }
         try { await driver.selectShops(shops); } catch (error) { snapshot.notes.push('Khôi phục bộ lọc: ' + error.message); }
-        const records = await historyPromise;
-        const latest = Object.values(records).filter(row => row.date <= date).sort((a, b) => a.date.localeCompare(b.date)).at(-1);
-        const savedCatalog = GM_getValue(catalogKey(cfg), null) || latest?.catalog || cfg.healthBICatalog || {};
-        for (const kind of kinds) {
-            const complete = shops.every(shop => snapshot.stores[shop.id]?.[kind]?.complete);
-            const previous = savedCatalog[kind]?.items || {};
-            const discovered = { ...authoritative[kind].items, ...catalogFrom(snapshot, kind) };
-            const canReplace = complete && authoritative[kind].complete;
-            snapshot.catalog[kind] = { complete, authoritative: canReplace, items: mergeCatalog(previous, discovered, canReplace) };
-        }
+        const complete = shops.every(shop => snapshot.stores[shop.id]?.industry?.complete);
+        const currentRows = fixedRows.map(row => {
+            const observed = shops.map(shop => snapshot.stores[shop.id]?.industry?.items?.[row.id]).find(item => item?.sourceId);
+            return observed ? { ...row, parentId: observed.parentId, depth: observed.depth } : clone(row);
+        });
+        snapshot.catalog.industry = { complete, authoritative: true, items: Object.fromEntries(currentRows.map(row => [row.id, row])) };
+        snapshot.catalog.group = { complete, authoritative: true, items: {} };
         return snapshot;
     }
 
@@ -985,9 +930,9 @@
         return promise;
     }
 
-    function rowsHTML(snapshot, previous, before, beforePrevious, scope, kind, shops, mode) {
+    function rowsHTML(snapshot, previous, before, beforePrevious, scope, kind, shops, mode, selectedRows = null) {
         const catalog = snapshot?.catalog?.[kind]?.items || {};
-        const list = Object.values(catalog);
+        const list = selectedRows || Object.values(catalog);
         if (!list.length) return '<tr><td colspan="7">Chưa có danh mục BI được xác minh.</td></tr>';
         return list.map(row => {
             const current = valuesFor(snapshot, before, scope, kind, row.id, shops, mode);
@@ -1000,11 +945,11 @@
     }
 
     function tableHTML(title, body, date, previous, mode) {
-        return `<div class="health-bi-section"><div class="health-bi-caption">${escape(title)} · ${mode === 'day' ? 'Riêng ngày' : 'Lũy kế'} ${escape(displayDate(date))} ↔ ${escape(displayDate(previous))}</div><div class="health-bi-scroll"><table class="sk-inner-table health-bi-table"><colgroup><col style="width:28%"><col style="width:9%"><col style="width:14%"><col style="width:9%"><col style="width:14%"><col style="width:15%"><col style="width:11%"></colgroup><thead><tr class="sk-match-header"><th class="sk-purple">Ngành / Nhóm hàng</th><th class="sk-purple">SL<br>tháng này</th><th class="sk-purple">DTQĐ<br>tháng này</th><th class="sk-purple">SL<br>tháng trước</th><th class="sk-purple">DTQĐ<br>tháng trước</th><th class="sk-purple">DTQĐ<br>tăng/giảm</th><th class="sk-purple">%</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
+        return `<div class="health-bi-section"><div class="health-bi-caption">${escape(title)} · ${mode === 'day' ? 'Riêng ngày' : 'Lũy kế'} ${escape(displayDate(date))} ↔ ${escape(displayDate(previous))}</div><div class="health-bi-scroll"><table class="sk-inner-table health-bi-table"><colgroup><col style="width:28%"><col style="width:9%"><col style="width:14%"><col style="width:9%"><col style="width:14%"><col style="width:15%"><col style="width:11%"></colgroup><thead><tr class="sk-match-header"><th class="sk-purple">Nhóm hàng</th><th class="sk-purple">SL<br>tháng này</th><th class="sk-purple">DTQĐ<br>tháng này</th><th class="sk-purple">SL<br>tháng trước</th><th class="sk-purple">DTQĐ<br>tháng trước</th><th class="sk-purple">DTQĐ<br>tăng/giảm</th><th class="sk-purple">%</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
     }
 
     function pieHTML(snapshot, before, scope, shops, mode, title) {
-        const roots = Object.values(snapshot?.catalog?.industry?.items || {}).filter(row => !row.parentId);
+        const roots = fixedRows.map(row => snapshot?.catalogMode === FIXED_MODE ? snapshot.catalog?.industry?.items?.[row.id] || row : row).filter(row => !row.parentId);
         const rawEntries = roots.map(row => ({ id: row.id, name: row.name, value: valuesFor(snapshot, before, scope, 'industry', row.id, shops, mode)?.dtqd }));
         const positiveOnly = rawEntries.some(row => row.value < 0);
         let entries = rawEntries.filter(row => row.value > 0);
@@ -1056,14 +1001,16 @@
         const container = doc.querySelector('.sk-macro-container');
         if (!container) return html;
         const rows = Array.from(container.children).filter(el => el.classList.contains('sk-macro-row'));
+        const entries = fixedRows.map(row => ({ ...row, ...(view.snapshot?.catalogMode === FIXED_MODE ? view.snapshot.catalog?.industry?.items?.[row.id] : {}), name: row.name }));
+        const splitAt = FIXED_NAMES.indexOf('Phụ kiện - Đồng hồ');
         const first = rows[0];
         const right = first?.querySelector('.sk-col-right');
-        if (right) right.innerHTML = tableHTML('NGÀNH HÀNG BI', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode), view.date, view.previous, view.mode);
+        if (right) right.innerHTML = tableHTML('NHÓM HÀNG THEO DÕI · 1–20 / 46', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode, entries.slice(0, splitAt)), view.date, view.previous, view.mode);
         rows.slice(1).forEach(row => row.remove());
         const second = doc.createElement('div');
         second.className = 'sk-macro-row';
         second.style.borderTop = '2px solid #000';
-        second.innerHTML = `<div class="sk-col-left health-bi-pies">${pieHTML(view.snapshot, view.before, scope, view.shops, view.mode, 'Tỷ trọng tháng này')}${pieHTML(view.old, view.beforePrevious, scope, view.shops, view.mode, 'Tỷ trọng tháng trước')}</div><div class="sk-col-right">${tableHTML('NHÓM HÀNG BI', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'group', view.shops, view.mode), view.date, view.previous, view.mode)}</div>`;
+        second.innerHTML = `<div class="sk-col-left health-bi-pies">${pieHTML(view.snapshot, view.before, scope, view.shops, view.mode, 'Tỷ trọng tháng này')}${pieHTML(view.old, view.beforePrevious, scope, view.shops, view.mode, 'Tỷ trọng tháng trước')}</div><div class="sk-col-right">${tableHTML('NHÓM HÀNG THEO DÕI · 21–46 / 46', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode, entries.slice(splitAt)), view.date, view.previous, view.mode)}</div>`;
         container.appendChild(second);
         const date = container.querySelector('.sk-date');
         if (date) {
@@ -1073,7 +1020,7 @@
         const hint = doc.createElement('div');
         hint.className = 'health-bi-note';
         const partial = kinds.some(kind => !view.snapshot?.catalog?.[kind]?.complete);
-        hint.textContent = !cfg.historySheetId ? 'Khai báo ID Google Sheet lịch sử để lưu và đối chiếu theo ngày.' : historyErrors.get(String(cfg.historySheetId).trim()) || (!view.old ? 'Chưa có bản lưu ngày ' + displayDate(view.previous) + ' để đối chiếu.' : partial ? 'Một phần BI chưa xác minh xong; danh mục cũ được giữ để tránh xóa nhầm.' : 'Đối chiếu cùng ngày tháng trước · Số 0 là dữ liệu hợp lệ.');
+        hint.textContent = !cfg.historySheetId ? 'Khai báo ID Google Sheet lịch sử để lưu và đối chiếu theo ngày.' : historyErrors.get(String(cfg.historySheetId).trim()) || (!view.old ? 'Chưa có bản lưu ngày ' + displayDate(view.previous) + ' để đối chiếu.' : partial ? 'Một phần dữ liệu chưa xác minh xong; vẫn giữ đủ 46 nhóm theo dõi.' : '46 nhóm cố định · Đối chiếu cùng ngày tháng trước · Số 0 là dữ liệu hợp lệ.');
         container.appendChild(hint);
         const style = doc.createElement('style');
         style.textContent = `
@@ -1138,7 +1085,7 @@
         data.saveHistoryToSheet(cache, cfg, finish, displayDate(snapshot.date));
     });
 
-    data.healthBI = { version: VERSION, shopList, isoDate, previousDay, previousMonthDate, pack, unpack, fromRecord, historyMap, mergeCatalog, metricFor, valuesFor, readPage, collectSnapshot, attachSnapshot, driver, rowsHTML, tableHTML, pieHTML, viewModel, loadHistory };
+    data.healthBI = { version: VERSION, catalogMode: FIXED_MODE, fixedNames: FIXED_NAMES, fixedRows, fixedPart, shopList, isoDate, previousDay, previousMonthDate, pack, unpack, fromRecord, historyMap, metricFor, valuesFor, readPage, collectSnapshot, attachSnapshot, driver, rowsHTML, tableHTML, pieHTML, viewModel, loadHistory };
 })(_0x1c5250, _0x36259b, _0x432e89, _0x1221a3, hook => {
     const original = _0x3429b9;
     _0x3429b9 = (cache, cfg) => hook(original, cache, cfg);
