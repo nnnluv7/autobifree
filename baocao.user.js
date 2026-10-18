@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.6.2
+// @version      1.6.3
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -1007,7 +1007,7 @@
         const second = doc.createElement('div');
         second.className = 'sk-macro-row';
         second.style.borderTop = '2px solid #000';
-        second.innerHTML = `<div class="sk-col-left health-bi-pies">${pieHTML(view.snapshot, view.before, scope, view.shops, view.mode, 'Tỷ trọng tháng này')}${pieHTML(view.old, view.beforePrevious, scope, view.shops, view.mode, 'Tỷ trọng tháng trước')}</div><div class="sk-col-right">${tableHTML('NHÓM HÀNG THEO DÕI · 21–46 / 39', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode, entries.slice(splitAt)), view.date, view.previous, view.mode)}</div>`;
+        second.innerHTML = `<div class="sk-col-left health-bi-pies">${pieHTML(view.snapshot, view.before, scope, view.shops, view.mode, 'Tỷ trọng tháng này')}${pieHTML(view.old, view.beforePrevious, scope, view.shops, view.mode, 'Tỷ trọng tháng trước')}</div><div class="sk-col-right">${tableHTML('NHÓM HÀNG THEO DÕI · 21–39 / 39', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode, entries.slice(splitAt)), view.date, view.previous, view.mode)}</div>`;
         container.appendChild(second);
         const date = container.querySelector('.sk-date');
         if (date) {
