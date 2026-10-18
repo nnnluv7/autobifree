@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.4.2
+// @version      1.5.0
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -340,5 +340,809 @@
     installControls();
 })(_0x2aa741, _0x1c5250, _0x432e89, _0x1221a3, state => { _0x4dbbf5 = state; });
 // CHILL14_CUSTOM_END
+
+// AUTOBI_HEALTH_BI_START
+(function installHealthBI(data, utils, ui, constants, installFinalizer) {
+    'use strict';
+    if (data.healthBI) return;
+    const VERSION = 1;
+    const FIELD = 'healthBI';
+    const MAX_CHUNK = 30000;
+    const kinds = ['industry', 'group'];
+    const fmt = n => n == null ? 'Chưa lưu' : new Intl.NumberFormat('vi-VN', { maximumFractionDigits: 1 }).format(n);
+    const escape = value => String(value == null ? '' : value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const slug = value => utils.toUltraSlug(String(value || ''));
+    const clone = value => JSON.parse(JSON.stringify(value));
+    const text = el => String(el?.getAttribute?.('title') || el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const visible = el => !!el && !el.hidden && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+    const native = el => visible(el) && !el.closest('#capture-area, [id^="tgdd-"], [id^="chill14-"]');
+    const nativeOption = el => native(el) || native(el.closest('label, .ant-checkbox-wrapper, [role="option"]'));
+    const nativeButtons = () => Array.from(document.querySelectorAll('button')).filter(native);
+    const zero = () => ({ sl: 0, dtqd: 0, dtthuc: 0, dttragop: 0 });
+    const metrics = ['sl', 'dtqd', 'dtthuc', 'dttragop'];
+    const historyBySheet = new Map();
+    const loadingHistory = new Set();
+    const loadedHistory = new Set();
+    const historyErrors = new Map();
+    const historyPromises = new Map();
+    let runConfig = null;
+    let collected = false;
+    let collecting = null;
+    const liveHistoryBySheet = new Map();
+    let selectedDate = '';
+    let comparisonMode = 'mtd';
+
+    function shopList(cfg) {
+        const seen = new Set();
+        return [1, 2, 3, 4, 5].flatMap(i => {
+            const name = String(cfg['shop' + i] || '').trim();
+            const code = String(cfg['shopCode' + i] || cfg['makho' + i] || name.match(/^(\d+)\s*[-–]/)?.[1] || '').trim();
+            if (!name && !code) return [];
+            const id = code ? 'code:' + code : 'name:' + slug(name);
+            if (seen.has(id)) return [];
+            seen.add(id);
+            return [{ id, code, name, short: cfg['shop' + i + 'Short'] || name || code, key: 'shop' + i }];
+        });
+    }
+
+    function isoDate(value) {
+        const s = String(value || '').trim();
+        let m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (m) return validDate(+m[1], +m[2], +m[3]);
+        m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+        return m ? validDate(+m[3], +m[2], +m[1]) : '';
+    }
+
+    function validDate(y, m, d) {
+        const dt = new Date(Date.UTC(y, m - 1, d));
+        return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d
+            ? [y, String(m).padStart(2, '0'), String(d).padStart(2, '0')].join('-') : '';
+    }
+
+    function displayDate(iso) {
+        const [y, m, d] = String(iso).split('-');
+        return d && m && y ? [d, m, y].join('/') : String(iso || '');
+    }
+
+    function today() {
+        const p = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+        const get = type => p.find(part => part.type === type).value;
+        return [get('year'), get('month'), get('day')].join('-');
+    }
+
+    function previousDay(iso) {
+        const date = new Date(iso + 'T00:00:00Z');
+        date.setUTCDate(date.getUTCDate() - 1);
+        return date.toISOString().slice(0, 10);
+    }
+
+    function previousMonthDate(iso) {
+        const [y, m, d] = iso.split('-').map(Number);
+        const date = new Date(Date.UTC(y, m - 2, 1));
+        const last = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
+        return validDate(date.getUTCFullYear(), date.getUTCMonth() + 1, Math.min(d, last));
+    }
+
+    function reportDate() {
+        const current = today();
+        const nativeMonth = document.querySelector('.ant-picker input')?.value;
+        const choice = String(nativeMonth || GM_getValue('tgdd_custom_report_month', 'current'));
+        const m = choice.match(/^(\d{1,2})\/(\d{4})$/);
+        if (!m) return current;
+        const month = +m[1], year = +m[2];
+        if (month < 1 || month > 12) return current;
+        if (current.slice(0, 7) === `${year}-${String(month).padStart(2, '0')}`) return current;
+        if (`${year}-${String(month).padStart(2, '0')}` > current.slice(0, 7)) return '';
+        return validDate(year, month, new Date(Date.UTC(year, month, 0)).getUTCDate());
+    }
+
+    function hash(value) {
+        let result = 2166136261;
+        for (let i = 0; i < value.length; i++) result = Math.imul(result ^ value.charCodeAt(i), 16777619);
+        return (result >>> 0).toString(16);
+    }
+
+    function pack(snapshot) {
+        const json = JSON.stringify(snapshot), chunks = {};
+        let i = 0, n = 0;
+        while (i < json.length) {
+            let end = Math.min(i + MAX_CHUNK, json.length);
+            if (end < json.length && /[\uD800-\uDBFF]/.test(json[end - 1])) end--;
+            chunks['c' + String(n++).padStart(4, '0')] = 'json:' + json.slice(i, end);
+            i = end;
+        }
+        return { schema: VERSION, date: snapshot.date, count: n, checksum: 'fnv1:' + hash(json), chunks };
+    }
+
+    function unpack(value) {
+        if (!value || Number(value.schema) !== VERSION) return null;
+        const count = Number(value.count);
+        if (!Number.isInteger(count) || count < 1 || count > 2000) return null;
+        let json = '';
+        for (let i = 0; i < count; i++) {
+            const chunk = value.chunks?.['c' + String(i).padStart(4, '0')];
+            if (typeof chunk !== 'string' || !chunk.startsWith('json:')) return null;
+            json += chunk.slice(5);
+        }
+        if ('fnv1:' + hash(json) !== value.checksum) return null;
+        try {
+            const parsed = JSON.parse(json);
+            return parsed.version === VERSION && isoDate(parsed.date) ? parsed : null;
+        } catch (_) { return null; }
+    }
+
+    function fromRecord(record) {
+        if (!record) return null;
+        if (record[FIELD]) return unpack(record[FIELD]);
+        if (Array.isArray(record)) record = Object.fromEntries(record.map(row => [row.name, row.value]));
+        const packed = { chunks: {} };
+        for (const [key, value] of Object.entries(record)) {
+            const parts = key.split('|||');
+            if (parts[0] !== FIELD) continue;
+            if (parts[1] === 'chunks') packed.chunks[parts[2]] = value;
+            else packed[parts[1]] = value;
+        }
+        return unpack(packed);
+    }
+
+    function historyMap(records) {
+        const result = {};
+        for (const [date, record] of Object.entries(records || {})) {
+            const snapshot = fromRecord(record);
+            const key = isoDate(date);
+            if (snapshot && key && snapshot.date === key) result[key] = snapshot;
+        }
+        return result;
+    }
+
+    function mergeCatalog(previous, discovered, complete) {
+        return complete ? clone(discovered) : { ...clone(previous || {}), ...clone(discovered) };
+    }
+
+    function metricFor(snapshot, scope, kind, id, shops) {
+        if (!snapshot) return null;
+        const requested = scope === 'total' ? shops : shops.filter(shop => shop.key === scope || shop.id === scope);
+        if (!requested.length) return null;
+        const result = zero();
+        for (const shop of requested) {
+            const part = snapshot.stores?.[shop.id]?.[kind];
+            if (!part) return null;
+            const value = id === '__total__' ? part.total : part.items?.[id]?.metrics || (part.complete ? zero() : null);
+            if (!value) return null;
+            for (const metric of metrics) {
+                if (value[metric] == null) result[metric] = null;
+                else if (result[metric] != null) result[metric] += value[metric];
+            }
+        }
+        return result;
+    }
+
+    function valuesFor(snapshot, before, scope, kind, id, shops, mode) {
+        const current = metricFor(snapshot, scope, kind, id, shops);
+        if (mode !== 'day' || !current) return current;
+        if (snapshot.date.endsWith('-01')) return current;
+        if (!before || previousDay(snapshot.date) !== before.date) return null;
+        const previous = metricFor(before, scope, kind, id, shops);
+        if (!previous) return null;
+        return Object.fromEntries(metrics.map(key => [key, current[key] == null || previous[key] == null ? null : current[key] - previous[key]]));
+    }
+
+    function numeric(value) {
+        const str = String(value || '').trim();
+        if (!str) return null;
+        if (/^[-–—]+$/.test(str)) return 0;
+        const num = Number(str.replace(/,/g, '').replace(/[^\d.\-]/g, ''));
+        return Number.isFinite(num) && /\d/.test(str) ? num : null;
+    }
+
+    function readPage(kind, table, stack = []) {
+        const headers = Array.from(table.querySelectorAll('thead th, thead td')).map(text);
+        const names = headers.map(slug);
+        const labelIndex = Math.max(0, names.findIndex(name => /nganhhang|nhomhang/.test(name)));
+        const find = accepted => names.findIndex(name => accepted.includes(name));
+        const columns = { sl: find(['soluong', 'sl']), dtqd: find(['doanhthuqd', 'dtqd', 'doanhthuquydoi']), dtthuc: find(['doanhthu', 'dtthuc', 'dt']), dttragop: find(['dttragop', 'doanhthutragop']) };
+        const valid = /nganhhang|nhomhang/.test(names[labelIndex] || '') && columns.sl >= 0 && columns.dtqd >= 0;
+        const items = {}, readMetrics = cells => Object.fromEntries(metrics.map(key => [key, columns[key] >= 0 ? numeric(text(cells[columns[key]])) : null]));
+        let total = null, badCells = false;
+        if (!valid) return { items, total, valid: false, badCells: true, stack };
+        for (const row of table.querySelectorAll('tbody tr, tfoot tr')) {
+            if (row.classList.contains('ant-table-measure-row')) continue;
+            const cells = Array.from(row.querySelectorAll('td, th'));
+            if (cells.length <= Math.max(columns.sl, columns.dtqd)) continue;
+            const cell = cells[labelIndex];
+            let label = text(cell).replace(/^[+−]\s*/, '').trim();
+            const raw = row.getAttribute('data-row-key') || '';
+            const value = readMetrics(cells);
+            if (row.classList.contains('grid-total-row') || row.classList.contains('ant-table-summary') || raw.includes('__total__') || /^tong(?:\d+dong)?$/.test(slug(label))) {
+                total = value;
+                continue;
+            }
+            if (!label) continue;
+            const ariaLevel = row.getAttribute('aria-level');
+            const depth = ariaLevel != null ? Math.max(0, Number(ariaLevel) - 1) : Number(row.className.match(/ant-table-row-level-(\d+)/)?.[1]) || 0;
+            const code = label.match(/^(\d+)\s*[-–:]\s*/)?.[1] || raw.replace(/^[pgc]-/, '');
+            label = label.replace(/^\d+\s*[-–:]\s*/, '').trim();
+            const parentId = depth > 0 ? stack[depth - 1] || '' : '';
+            const id = kind + ':' + (code || 'name-' + hash(parentId + ':' + slug(label)));
+            stack[depth] = id;
+            stack.length = depth + 1;
+            const ok = value.sl != null && value.dtqd != null;
+            if (!ok) badCells = true;
+            items[id] = { id, code, name: label, parentId, depth, metrics: value };
+        }
+        return { items, total, valid, badCells, stack };
+    }
+
+    function tableElement() {
+        return Array.from(document.querySelectorAll('.report-table table, .ant-table-content table')).find(table => native(table));
+    }
+
+    function busy() {
+        return Array.from(document.querySelectorAll('.ant-spin-spinning, [aria-busy="true"], .loading, .spinner')).some(native);
+    }
+
+    async function quiet(max = 12000) {
+        const end = Date.now() + max;
+        let last = '', stable = 0;
+        while (Date.now() < end) {
+            const table = tableElement();
+            const signature = table ? text(table) : '';
+            if (!busy() && table && signature === last) {
+                if (++stable >= 2) return true;
+            } else stable = 0;
+            last = signature;
+            await sleep(250);
+        }
+        return false;
+    }
+
+    async function switchDimension(kind) {
+        const accepted = kind === 'industry' ? ['nganhhangbi', 'nganhhang'] : ['nhomhangbi', 'nhomhang'];
+        const button = nativeButtons().find(el => accepted.includes(slug(text(el))));
+        if (button) {
+            if (!button.classList.contains('bg-blue-600') && button.getAttribute('aria-selected') !== 'true') button.click();
+            await sleep(350);
+            return quiet();
+        }
+        const select = Array.from(document.querySelectorAll('select')).filter(native).find(el => Array.from(el.options).some(option => accepted.includes(slug(text(option)))));
+        if (select) {
+            select.value = Array.from(select.options).find(option => accepted.includes(slug(text(option)))).value;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            await sleep(350);
+            return quiet();
+        }
+        return false;
+    }
+
+    async function crawl(kind) {
+        const items = {}, clicked = new Set(), pages = new Set();
+        let total = null, complete = true, expanded = false, stack = [];
+        const deadline = Date.now() + 120000;
+        const first = Array.from(document.querySelectorAll('.ant-pagination-item-1')).find(native);
+        if (first && !first.classList.contains('ant-pagination-item-active')) { first.click(); await quiet(); }
+        const scroller = () => {
+            const table = tableElement();
+            return [table?.closest('.ant-table-body'), ...Array.from(document.querySelectorAll('.rc-virtual-list-holder'))]
+                .find(el => el && native(el) && el.clientHeight > 0 && el.scrollHeight > el.clientHeight + 8);
+        };
+        const initialScroll = scroller();
+        if (initialScroll) { initialScroll.scrollTop = 0; await sleep(200); }
+        for (let turn = 0; turn < 2000; turn++) {
+            if (turn === 1999) complete = false;
+            if (Date.now() >= deadline) { complete = false; break; }
+            if (!await quiet()) { complete = false; break; }
+            const table = tableElement();
+            if (!table) { complete = false; break; }
+            const page = readPage(kind, table, stack);
+            stack = page.stack;
+            Object.assign(items, page.items);
+            if (page.total) total = page.total;
+            if (!page.valid || page.badCells) { complete = false; break; }
+            const collapsed = Array.from(table.querySelectorAll('button.ant-table-row-expand-icon-collapsed, button[aria-expanded="false"], [role="button"][aria-expanded="false"]')).filter(visible);
+            const fresh = collapsed.filter(button => {
+                const row = button.closest('tr');
+                return row && !clicked.has(row.getAttribute('data-row-key') || text(row.querySelector('td')));
+            });
+            if (fresh.length) {
+                for (const button of fresh.slice(0, 8)) {
+                    if (!button.isConnected) continue;
+                    const row = button.closest('tr');
+                    clicked.add(row.getAttribute('data-row-key') || text(row.querySelector('td')));
+                    button.click();
+                    expanded = true;
+                    await sleep(80);
+                }
+                await sleep(300);
+                continue;
+            }
+            if (collapsed.length) complete = false;
+            const scroll = scroller();
+            if (scroll && scroll.scrollTop + scroll.clientHeight < scroll.scrollHeight - 4) {
+                const old = scroll.scrollTop;
+                scroll.scrollTop = Math.min(scroll.scrollTop + scroll.clientHeight * .7, scroll.scrollHeight);
+                scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
+                if (scroll.scrollTop <= old) { complete = false; break; }
+                await sleep(300);
+                continue;
+            }
+            const next = Array.from(document.querySelectorAll('.ant-pagination-next, button[aria-label="Next Page"]')).find(el =>
+                native(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !el.classList.contains('ant-pagination-disabled'));
+            if (!next) break;
+            const key = Array.from(document.querySelectorAll('.ant-pagination-item-active')).map(text).join(',') + ':' + Object.keys(page.items).join(',');
+            if (pages.has(key)) { complete = false; break; }
+            pages.add(key);
+            next.click();
+            await sleep(350);
+            stack = [];
+        }
+        if (!Object.keys(items).length && !Array.from(document.querySelectorAll('.ant-empty, .ant-table-placeholder')).some(native)) complete = false;
+        if (!total && complete) {
+            const roots = Object.values(items).filter(item => !item.parentId);
+            total = roots.reduce((result, item) => {
+                for (const key of metrics) result[key] = result[key] == null || item.metrics[key] == null ? null : result[key] + item.metrics[key];
+                return result;
+            }, zero());
+        }
+        return { complete, items, total, expanded };
+    }
+
+    function optionState(option) {
+        if (typeof option.checked === 'boolean') return option.checked;
+        return option.getAttribute('aria-checked') === 'true';
+    }
+
+    function shopMatches(label, shop) {
+        if (shop.code && /^\d+$/.test(shop.code) && new RegExp('(^|\\D)' + shop.code + '(\\D|$)').test(label)) return true;
+        const name = slug(label);
+        return name && [shop.name, shop.short].some(value => slug(value) === name);
+    }
+
+    async function selectShops(shops) {
+        const trigger = nativeButtons().find(button => Array.from(button.querySelectorAll('span')).some(span => slug(text(span)) === 'sieuthi'));
+        if (!trigger) throw new Error('Không tìm thấy bộ lọc Siêu thị.');
+        trigger.click();
+        await sleep(350);
+        const options = () => {
+            const inputs = Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(nativeOption);
+            return inputs.length ? inputs : Array.from(document.querySelectorAll('[role="checkbox"]')).filter(native);
+        };
+        const label = option => text(option.closest('label, [role="option"]') || option.parentElement);
+        const clear = nativeButtons().find(button => /bochontatca|huychontatca/.test(slug(text(button))));
+        if (clear) { clear.click(); await sleep(150); }
+        else {
+            for (const option of options()) if (optionState(option)) option.click();
+            await sleep(150);
+        }
+        for (const shop of shops) {
+            let matches = options().filter(option => shopMatches(label(option), shop));
+            if (!matches.length) {
+                const search = Array.from(document.querySelectorAll('input')).filter(native).find(input => /timkiem|search/.test(slug(input.placeholder || '')));
+                if (search) {
+                    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(search, shop.code || shop.name);
+                    search.dispatchEvent(new Event('input', { bubbles: true }));
+                    await sleep(250);
+                    matches = options().filter(option => shopMatches(label(option), shop));
+                }
+            }
+            if (matches.length !== 1) { trigger.click(); throw new Error('Chưa xác minh được bộ lọc riêng ' + shop.short); }
+            if (!optionState(matches[0])) matches[0].click();
+            await sleep(120);
+        }
+        const checked = options().filter(optionState).filter(option => !/chontatca/.test(slug(label(option))));
+        if (checked.length !== shops.length || shops.some(shop => !checked.some(option => shopMatches(label(option), shop)))) {
+            trigger.click();
+            throw new Error('Bộ lọc Siêu thị chưa khớp khai báo.');
+        }
+        const apply = nativeButtons().find(button => ['apdung', 'xacnhan', 'xong'].includes(slug(text(button))));
+        if (apply) apply.click();
+        else trigger.click();
+        await sleep(250);
+        const count = text(trigger).match(/(\d+)\s*(?:siêu thị|đã chọn)/i);
+        if (count && +count[1] !== shops.length) throw new Error('Số siêu thị đã chọn chưa khớp khai báo.');
+        const reload = nativeButtons().find(button => /tailai/.test(slug(text(button))) || button.querySelector('.lucide-rotate-cw'));
+        if (reload && !reload.disabled) reload.click();
+        await sleep(300);
+        if (!await quiet()) throw new Error('Dữ liệu chưa tải xong cho siêu thị đã chọn.');
+    }
+
+    function derivedGroups(industry) {
+        const items = {};
+        for (const row of Object.values(industry.items || {})) if (row.depth > 0) {
+            const id = row.id.replace(/^industry:/, 'group:');
+            items[id] = { ...clone(row), id, parentId: row.parentId.replace(/^industry:/, 'group:'), depth: Math.max(0, row.depth - 1) };
+        }
+        for (const item of Object.values(items)) if (!items[item.parentId]) item.parentId = '';
+        return { items, total: industry.total, complete: industry.complete && industry.expanded, derived: true };
+    }
+
+    function catalogFrom(snapshot, kind) {
+        const items = {};
+        for (const shop of snapshot.shops) for (const row of Object.values(snapshot.stores[shop.id]?.[kind]?.items || {})) {
+            const { metrics: ignored, ...metadata } = row;
+            items[row.id] = metadata;
+        }
+        return items;
+    }
+
+    async function readCatalog(kind) {
+        const accepted = kind === 'industry' ? ['nganhhang', 'nganhhangbi'] : ['nhomhang', 'nhomhangbi'];
+        const matches = button => Array.from(button.querySelectorAll('span')).some(span => accepted.includes(slug(text(span))));
+        const trigger = nativeButtons().find(button => button.classList.contains('filter-field-card') && matches(button)) ||
+            nativeButtons().find(button => matches(button) && !accepted.includes(slug(text(button))));
+        if (!trigger) return { items: {}, complete: false };
+        const items = {}, clicked = new Set();
+        let complete = true, opened = false;
+        const options = () => Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(nativeOption);
+        const panelRoot = () => {
+            const inputs = options();
+            if (!inputs.length) return null;
+            let node = inputs[0].parentElement;
+            let common = null;
+            while (node && node !== document.body) {
+                if (!common && inputs.every(input => node.contains(input))) common = node;
+                if (['absolute', 'fixed'].includes(getComputedStyle(node).position)) return node;
+                node = node.parentElement;
+            }
+            return common;
+        };
+        const scrollBox = () => {
+            let node = options()[0]?.parentElement;
+            while (node && node !== document.body) {
+                if (node.clientHeight > 0 && node.scrollHeight > node.clientHeight + 8 && node.querySelectorAll('input[type="checkbox"]').length > 1) return node;
+                node = node.parentElement;
+            }
+            return null;
+        };
+        try {
+            trigger.click(); opened = true;
+            await sleep(350);
+            const box = scrollBox();
+            if (box) { box.scrollTop = 0; await sleep(200); }
+            const deadline = Date.now() + 60000;
+            for (let turn = 0; turn < 500; turn++) {
+                if (Date.now() > deadline || turn === 499) { complete = false; break; }
+                for (const option of options()) {
+                    const row = option.closest('label, [role="treeitem"], [role="option"]') || option.parentElement;
+                    const label = text(row);
+                    if (!label || /^(?:bo)?chontatca$/.test(slug(label))) continue;
+                    const name = label.replace(/^\d+\s*[-–:]\s*/, '').trim();
+                    const code = label.match(/^(\d+)\s*[-–:]\s*/)?.[1] || (/^\d+$/.test(option.value || '') ? option.value : '');
+                    const id = kind + ':' + (code || 'name-' + hash(':' + slug(name)));
+                    items[id] = { id, code, name, parentId: '', depth: 0 };
+                }
+                const panel = panelRoot();
+                const expand = Array.from(panel?.querySelectorAll('button[aria-expanded="false"], [role="button"][aria-expanded="false"], .ant-tree-switcher_close') || []).filter(el =>
+                    native(el) && !el.classList.contains('filter-field-card') && !el.closest('table, .report-table, .ant-table-content') && !clicked.has(el));
+                if (expand.length) {
+                    for (const el of expand.slice(0, 12)) { clicked.add(el); el.click(); }
+                    await sleep(400);
+                    continue;
+                }
+                const search = Array.from(document.querySelectorAll('input')).filter(native).find(input => /timkiem|search/.test(slug(input.placeholder || '')) && input.value);
+                if (search) complete = false;
+                const scroll = scrollBox();
+                if (!scroll || scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 4) break;
+                const before = scroll.scrollTop;
+                scroll.scrollTop += scroll.clientHeight * .7;
+                scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
+                if (scroll.scrollTop <= before) { complete = false; break; }
+                await sleep(250);
+            }
+            if (!Object.keys(items).length || busy()) complete = false;
+        } catch (_) { complete = false; }
+        finally { if (opened) trigger.click(); }
+        return { items, complete };
+    }
+
+    function alignPart(part, catalog, kind) {
+        if (!part) return;
+        const rawItems = part.items || {};
+        const entries = Object.values(catalog.items || {}), remap = {}, excluded = new Set();
+        for (const row of Object.values(part.items || {})) {
+            const candidates = entries.filter(item => (row.code && item.code === row.code) || slug(item.name) === slug(row.name));
+            if (candidates.length === 1) remap[row.id] = candidates[0].id;
+            else if (kind === 'industry' && catalog.complete && row.depth > 0 && !catalog.items[row.id]) excluded.add(row.id);
+            else if (!catalog.items[row.id]) catalog.complete = false;
+        }
+        part.items = Object.fromEntries(Object.values(part.items || {}).filter(row => !excluded.has(row.id)).map(row => {
+            const id = remap[row.id] || row.id;
+            let parentId = row.parentId;
+            const seen = new Set();
+            while (excluded.has(parentId) && !seen.has(parentId)) { seen.add(parentId); parentId = rawItems[parentId]?.parentId || ''; }
+            return [id, { ...row, id, parentId: remap[parentId] || parentId }];
+        }));
+    }
+
+    const driver = { selectShops, switchDimension, crawl, readCatalog };
+
+    function catalogKey(cfg) {
+        return 'autobi_health_bi_catalog_v1:' + hash(String(cfg.historySheetId || '') + ':' + shopList(cfg).map(shop => shop.id).sort().join(','));
+    }
+
+    async function collectSnapshot(cfg) {
+        const shops = shopList(cfg), date = reportDate();
+        const snapshot = { version: VERSION, date, sheetId: String(cfg.historySheetId || '').trim(), capturedAt: new Date().toISOString(), shops, stores: {}, catalog: {}, notes: [] };
+        if (!shops.length || !date) throw new Error('Cần khai báo siêu thị và tháng báo cáo hợp lệ.');
+        const historyPromise = loadHistory(cfg);
+        await new Promise(resolve => {
+            let once = false;
+            const finish = () => { if (!once) { once = true; resolve(); } };
+            setTimeout(finish, 15000);
+            data.switchAndEnsureTabDMX('Lũy kế', finish);
+        });
+        const authoritative = {};
+        for (const kind of kinds) authoritative[kind] = await driver.readCatalog(kind);
+        for (const shop of shops) {
+            snapshot.stores[shop.id] = {};
+            try {
+                ui.showToast('Đang lấy BI: ' + shop.short, 0);
+                await driver.selectShops([shop]);
+                if (!await driver.switchDimension('industry')) throw new Error('Không mở được Ngành hàng BI.');
+                const industry = await driver.crawl('industry');
+                snapshot.stores[shop.id].industry = industry;
+                snapshot.stores[shop.id].group = await driver.switchDimension('group')
+                    ? await driver.crawl('group') : derivedGroups(industry);
+                for (const kind of kinds) alignPart(snapshot.stores[shop.id][kind], authoritative[kind], kind);
+            } catch (error) {
+                snapshot.notes.push(shop.short + ': ' + error.message);
+            }
+        }
+        try { await driver.selectShops(shops); } catch (error) { snapshot.notes.push('Khôi phục bộ lọc: ' + error.message); }
+        const records = await historyPromise;
+        const latest = Object.values(records).filter(row => row.date <= date).sort((a, b) => a.date.localeCompare(b.date)).at(-1);
+        const savedCatalog = GM_getValue(catalogKey(cfg), null) || latest?.catalog || cfg.healthBICatalog || {};
+        for (const kind of kinds) {
+            const complete = shops.every(shop => snapshot.stores[shop.id]?.[kind]?.complete);
+            const previous = savedCatalog[kind]?.items || {};
+            const discovered = { ...authoritative[kind].items, ...catalogFrom(snapshot, kind) };
+            const canReplace = complete && authoritative[kind].complete;
+            snapshot.catalog[kind] = { complete, authoritative: canReplace, items: mergeCatalog(previous, discovered, canReplace) };
+        }
+        return snapshot;
+    }
+
+    function legacyValues(snapshot, scope, cfg) {
+        const values = {};
+        for (const [id, row] of Object.entries(snapshot.catalog.industry.items)) {
+            const metric = metricFor(snapshot, scope, 'industry', id, shopList(cfg));
+            if (metric) values[row.name] = { ...metric, growth: 0, tg_ratio: metric.dtthuc > 0 ? metric.dttragop / metric.dtthuc * 100 : 0 };
+        }
+        return values;
+    }
+
+    function attachSnapshot(snapshot, cfg) {
+        const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {};
+        cache[FIELD] = pack(snapshot);
+        cache.link8_health = cache.link8_health || {};
+        cache.link8_health.total = legacyValues(snapshot, 'total', cfg);
+        for (const shop of snapshot.shops) cache.link8_health[shop.key] = legacyValues(snapshot, shop.key, cfg);
+        GM_setValue(constants.KEYS.DATA_CACHE, cache);
+        const key = String(cfg.historySheetId || '').trim();
+        liveHistoryBySheet.set(key, { ...(liveHistoryBySheet.get(key) || {}), [snapshot.date]: snapshot });
+        GM_setValue(catalogKey(cfg), snapshot.catalog);
+        cfg.healthBICatalog = { version: VERSION, updated: snapshot.date, counts: Object.fromEntries(kinds.map(kind => [kind, Object.keys(snapshot.catalog[kind].items).length])) };
+        utils.savePersistentConfig(cfg);
+        return cache.link8_health.total;
+    }
+
+    const saveConfig = utils.savePersistentConfig;
+    utils.savePersistentConfig = function (cfg) {
+        const previous = utils.getPersistentConfig();
+        if (!cfg.healthBICatalog && previous?.healthBICatalog && String(cfg.historySheetId || '') === String(previous.historySheetId || '')) cfg.healthBICatalog = clone(previous.healthBICatalog);
+        return saveConfig.call(this, cfg);
+    };
+
+    data.scrapeHealthCategoriesDMX = function (callback) {
+        const cfg = runConfig || utils.getPersistentConfig();
+        if (!collecting) collecting = collectSnapshot(cfg).then(snapshot => {
+            collected = true;
+            return attachSnapshot(snapshot, cfg);
+        }).catch(error => {
+            console.warn('[AutoBI Health BI]', error);
+            ui.showToast('BI chưa hoàn tất: ' + error.message, 5000);
+            collected = true;
+            return {};
+        }).finally(() => { collecting = null; });
+        collecting.then(value => { if (callback) callback(value); });
+    };
+
+    const originalRevenue = data.runRevenueSequenceDMX;
+    data.runRevenueSequenceDMX = function (cfg, callback) {
+        runConfig = cfg;
+        collected = false;
+        const finish = () => { runConfig = null; if (callback) callback(); };
+        return originalRevenue.call(this, cfg, () => {
+            if (collected) finish();
+            else data.scrapeHealthCategoriesDMX(finish);
+        });
+    };
+
+    function loadHistory(cfg) {
+        const sheetId = String(cfg.historySheetId || '').trim();
+        if (!sheetId || !constants.GSHEET.HISTORY_API) return Promise.resolve({});
+        if (loadedHistory.has(sheetId)) return Promise.resolve(historyBySheet.get(sheetId) || {});
+        if (loadingHistory.has(sheetId)) return historyPromises.get(sheetId);
+        loadingHistory.add(sheetId);
+        let resolve;
+        const promise = new Promise(done => { resolve = done; });
+        historyPromises.set(sheetId, promise);
+        let done = false;
+        const finish = (records, error = '') => {
+            if (done) return;
+            done = true;
+            loadingHistory.delete(sheetId);
+            loadedHistory.add(sheetId);
+            historyErrors.set(sheetId, error);
+            historyBySheet.set(sheetId, { ...historyMap(records), ...(liveHistoryBySheet.get(sheetId) || {}) });
+            resolve(historyBySheet.get(sheetId));
+            const active = document.querySelector('.rpt-nav-item.active[data-tab="health"]');
+            if (active) active.click();
+        };
+        GM_xmlhttpRequest({ method: 'GET', url: constants.GSHEET.HISTORY_API + '?sheetId=' + encodeURIComponent(sheetId), timeout: 15000,
+            onload: response => { try { const result = JSON.parse(response.responseText); finish(result.status === 'success' ? result.data : {}, result.status === 'success' ? '' : 'Chưa tải được lịch sử Google Sheet.'); } catch (_) { finish({}, 'Lịch sử Google Sheet chưa đọc được.'); } },
+            onerror: () => finish({}, 'Chưa kết nối được Google Sheet.'), ontimeout: () => finish({}, 'Google Sheet chưa phản hồi kịp.') });
+        return promise;
+    }
+
+    function rowsHTML(snapshot, previous, before, beforePrevious, scope, kind, shops, mode) {
+        const catalog = snapshot?.catalog?.[kind]?.items || {};
+        const list = Object.values(catalog);
+        if (!list.length) return '<tr><td colspan="7">Chưa có danh mục BI được xác minh.</td></tr>';
+        return list.map(row => {
+            const current = valuesFor(snapshot, before, scope, kind, row.id, shops, mode);
+            const old = valuesFor(previous, beforePrevious, scope, kind, row.id, shops, mode);
+            const delta = current?.dtqd == null || old?.dtqd == null ? null : current.dtqd - old.dtqd;
+            const pct = delta == null ? 'Chưa lưu' : old.dtqd === 0 ? (current.dtqd === 0 ? '0%' : 'Mới') : (delta > 0 ? '+' : '') + (delta / Math.abs(old.dtqd) * 100).toFixed(1) + '%';
+            const tone = delta == null ? '' : delta >= 0 ? 'health-bi-up' : 'health-bi-down';
+            return `<tr><td class="${row.depth ? 'sk-indent' : 'sk-peach'}" title="${escape(row.name)}"><span style="padding-left:${Math.min(row.depth || 0, 5) * 8}px">${escape(row.name)}</span></td><td>${fmt(current?.sl)}</td><td>${fmt(current?.dtqd)}</td><td>${fmt(old?.sl)}</td><td>${fmt(old?.dtqd)}</td><td class="${tone}">${delta > 0 ? '+' : ''}${fmt(delta)}</td><td class="${tone}">${pct}</td></tr>`;
+        }).join('');
+    }
+
+    function tableHTML(title, body, date, previous, mode) {
+        return `<div class="health-bi-section"><div class="health-bi-caption">${escape(title)} · ${mode === 'day' ? 'Riêng ngày' : 'Lũy kế'} ${escape(displayDate(date))} ↔ ${escape(displayDate(previous))}</div><div class="health-bi-scroll"><table class="sk-inner-table health-bi-table"><colgroup><col style="width:28%"><col style="width:9%"><col style="width:14%"><col style="width:9%"><col style="width:14%"><col style="width:15%"><col style="width:11%"></colgroup><thead><tr class="sk-match-header"><th class="sk-purple">Ngành / Nhóm hàng</th><th class="sk-purple">SL<br>tháng này</th><th class="sk-purple">DTQĐ<br>tháng này</th><th class="sk-purple">SL<br>tháng trước</th><th class="sk-purple">DTQĐ<br>tháng trước</th><th class="sk-purple">DTQĐ<br>tăng/giảm</th><th class="sk-purple">%</th></tr></thead><tbody>${body}</tbody></table></div></div>`;
+    }
+
+    function pieHTML(snapshot, before, scope, shops, mode, title) {
+        const roots = Object.values(snapshot?.catalog?.industry?.items || {}).filter(row => !row.parentId);
+        const rawEntries = roots.map(row => ({ id: row.id, name: row.name, value: valuesFor(snapshot, before, scope, 'industry', row.id, shops, mode)?.dtqd }));
+        const positiveOnly = rawEntries.some(row => row.value < 0);
+        let entries = rawEntries.filter(row => row.value > 0);
+        entries.sort((a, b) => b.value - a.value);
+        const all = entries.reduce((n, row) => n + row.value, 0);
+        if (entries.length > 7) entries = [...entries.slice(0, 6), { id: '__other__', name: 'Các ngành còn lại', value: entries.slice(6).reduce((n, row) => n + row.value, 0) }];
+        const colors = entries.map(row => row.id === '__other__' ? '#a5a5a5' : `hsl(${parseInt(hash(row.id), 16) % 360},65%,48%)`);
+        let angle = -Math.PI / 2;
+        const paths = entries.map((row, i) => {
+            const end = angle + row.value / all * Math.PI * 2;
+            const x1 = 60 + 56 * Math.cos(angle), y1 = 60 + 56 * Math.sin(angle), x2 = 60 + 56 * Math.cos(end), y2 = 60 + 56 * Math.sin(end);
+            const path = row.value === all ? `<circle cx="60" cy="60" r="56" fill="${colors[i]}"/>` : `<path d="M60 60 L${x1} ${y1} A56 56 0 ${end - angle > Math.PI ? 1 : 0} 1 ${x2} ${y2} Z" fill="${colors[i]}"/>`;
+            angle = end;
+            return path;
+        }).join('');
+        const legend = entries.map((row, i) => `<div><i style="background:${colors[i]}"></i><span title="${escape(row.name)}">${escape(row.name)}</span><b>${(row.value / all * 100).toFixed(1)}%</b></div>`).join('');
+        return `<section class="health-bi-pie"><h4>${escape(title)}</h4>${all > 0 ? `<div class="health-bi-pie-content"><svg viewBox="0 0 120 120" role="img" aria-label="${escape(title)}">${paths}</svg><div class="health-bi-legend">${legend}</div></div>${positiveOnly ? '<div class="health-bi-note">Tỷ trọng tính trên các ngành có DTQĐ dương.</div>' : ''}` : '<div class="health-bi-empty">Chưa có dữ liệu tỷ trọng</div>'}</section>`;
+    }
+
+    function viewModel(cache, cfg, scope, historical) {
+        const key = String(cfg.historySheetId || '').trim();
+        const parsed = unpack(cache?.[FIELD]);
+        const current = parsed && parsed.sheetId === key ? parsed : null;
+        const stored = historyBySheet.get(key) || {};
+        const history = { ...stored, ...(liveHistoryBySheet.get(key) || {}) };
+        if (current) history[current.date] = current;
+        const historicalISO = isoDate(historical);
+        const base = historicalISO || current?.date || today();
+        const date = historicalISO || (selectedDate.startsWith(base.slice(0, 7)) ? selectedDate : base);
+        const previous = previousMonthDate(date);
+        return { history, date, previous, snapshot: history[date] || null, old: history[previous] || null, before: history[previousDay(date)] || null, beforePrevious: history[previousDay(previous)] || null, shops: shopList(cfg), scope, mode: comparisonMode };
+    }
+
+    const baseHealth = ui.HTML.getHealthReport;
+    ui.HTML.getHealthReport = function (cache, cfg, scope, useBI, historical) {
+        loadHistory(cfg);
+        const view = viewModel(cache, cfg, scope, historical);
+        const safeCache = clone(cache || {});
+        const total = metricFor(view.snapshot, scope, 'industry', '__total__', view.shops);
+        if (total) {
+            safeCache.link2 = safeCache.link2 || {};
+            const source = { ...(safeCache.link2[scope] || {}) };
+            if (total.dtqd != null) source.r = total.dtqd;
+            if (total.dtthuc != null) source.dtlk = total.dtthuc;
+            safeCache.link2[scope] = source;
+        }
+        const html = baseHealth.call(this, safeCache, cfg, scope, useBI, displayDate(view.date));
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const container = doc.querySelector('.sk-macro-container');
+        if (!container) return html;
+        const rows = Array.from(container.children).filter(el => el.classList.contains('sk-macro-row'));
+        const first = rows[0];
+        const right = first?.querySelector('.sk-col-right');
+        if (right) right.innerHTML = tableHTML('NGÀNH HÀNG BI', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'industry', view.shops, view.mode), view.date, view.previous, view.mode);
+        rows.slice(1).forEach(row => row.remove());
+        const second = doc.createElement('div');
+        second.className = 'sk-macro-row';
+        second.style.borderTop = '2px solid #000';
+        second.innerHTML = `<div class="sk-col-left health-bi-pies">${pieHTML(view.snapshot, view.before, scope, view.shops, view.mode, 'Tỷ trọng tháng này')}${pieHTML(view.old, view.beforePrevious, scope, view.shops, view.mode, 'Tỷ trọng tháng trước')}</div><div class="sk-col-right">${tableHTML('NHÓM HÀNG BI', rowsHTML(view.snapshot, view.old, view.before, view.beforePrevious, scope, 'group', view.shops, view.mode), view.date, view.previous, view.mode)}</div>`;
+        container.appendChild(second);
+        const date = container.querySelector('.sk-date');
+        if (date) {
+            const available = [...new Set([view.date, ...Object.keys(view.history).filter(key => key.startsWith(view.date.slice(0, 7)))])].sort().reverse();
+            date.innerHTML = `<label>Ngày <select data-health-bi-date>${available.map(key => `<option value="${key}"${key === view.date ? ' selected' : ''}>${displayDate(key)}</option>`).join('')}</select></label> <select data-health-bi-mode><option value="mtd"${view.mode === 'mtd' ? ' selected' : ''}>Lũy kế đến ngày</option><option value="day"${view.mode === 'day' ? ' selected' : ''}>Riêng ngày</option></select>`;
+        }
+        const hint = doc.createElement('div');
+        hint.className = 'health-bi-note';
+        const partial = kinds.some(kind => !view.snapshot?.catalog?.[kind]?.complete);
+        hint.textContent = !cfg.historySheetId ? 'Khai báo ID Google Sheet lịch sử để lưu và đối chiếu theo ngày.' : historyErrors.get(String(cfg.historySheetId).trim()) || (!view.old ? 'Chưa có bản lưu ngày ' + displayDate(view.previous) + ' để đối chiếu.' : partial ? 'Một phần BI chưa xác minh xong; danh mục cũ được giữ để tránh xóa nhầm.' : 'Đối chiếu cùng ngày tháng trước · Số 0 là dữ liệu hợp lệ.');
+        container.appendChild(hint);
+        const style = doc.createElement('style');
+        style.textContent = `
+            .health-bi-section{min-width:0;width:100%}.health-bi-caption{padding:8px;background:#efe9ff;color:#583786;font-weight:700;font-size:11px;line-height:1.45}
+            .health-bi-scroll{max-height:620px;overflow:auto}.health-bi-table{table-layout:fixed;width:100%!important;font-size:11px!important}
+            .health-bi-table th{position:sticky;top:0;z-index:1;white-space:normal!important;line-height:1.35}.health-bi-table td{font-size:11px!important;white-space:normal!important;overflow-wrap:anywhere;padding:5px 3px!important;line-height:1.4}
+            .health-bi-table td:first-child{text-align:left!important}.health-bi-up{color:#168647!important}.health-bi-down{color:#d83535!important}
+            .health-bi-pies{background:#fff}.health-bi-pie{padding:10px 8px;border-bottom:1px solid #ddd}.health-bi-pie h4{text-align:center;margin:0 0 8px;font-size:12px;color:#333}
+            .health-bi-pie-content{display:flex;align-items:center;gap:8px}.health-bi-pie svg{width:112px;height:112px;flex-shrink:0}.health-bi-legend{flex:1;min-width:0;font-size:10px}
+            .health-bi-legend>div{display:flex;gap:4px;align-items:center;margin:5px 0}.health-bi-legend i{width:8px;height:8px;flex-shrink:0}.health-bi-legend span{flex:1;overflow-wrap:anywhere}.health-bi-legend b{white-space:nowrap;font-size:10px}
+            .health-bi-empty,.health-bi-note{padding:10px;font-size:11px;color:#666;line-height:1.5}.sk-date{flex-direction:column;gap:4px}.sk-date label{width:100%;font-size:11px}.sk-date select{width:100%;max-width:100%;border:1px solid #cbd5e1;border-radius:4px;padding:3px;background:#fff;font-size:11px}
+        `;
+        return (html.match(/<style>[\s\S]*?<\/style>/)?.[0] || '') + style.outerHTML + container.parentElement.outerHTML;
+    };
+
+    document.addEventListener('change', event => {
+        if (event.target.matches('[data-health-bi-date]')) selectedDate = isoDate(event.target.value);
+        else if (event.target.matches('[data-health-bi-mode]')) comparisonMode = event.target.value === 'day' ? 'day' : 'mtd';
+        else return;
+        document.querySelector('.rpt-nav-item.active[data-tab="health"]')?.click();
+    });
+
+    const originalSaveHistory = data.saveHistoryToSheet;
+    data.saveHistoryToSheet = function (cache, cfg, callback, date) {
+        const snapshot = unpack(cache?.[FIELD]);
+        if (snapshot && snapshot.sheetId !== String(cfg.historySheetId || '').trim()) {
+            const { [FIELD]: ignored, ...otherReports } = cache;
+            return originalSaveHistory.call(this, otherReports, cfg, callback, date);
+        }
+        if (!snapshot) return originalSaveHistory.call(this, cache, cfg, callback, date);
+        let done = false;
+        const finish = saved => {
+            if (done) return;
+            done = true;
+            if (saved) {
+                const key = String(cfg.historySheetId || '').trim();
+                liveHistoryBySheet.set(key, { ...(liveHistoryBySheet.get(key) || {}), [snapshot.date]: snapshot });
+            }
+            if (callback) callback(saved);
+        };
+        setTimeout(() => finish(false), 16000);
+        return originalSaveHistory.call(this, cache, cfg, finish, date || displayDate(snapshot.date));
+    };
+
+    installFinalizer((original, cache, cfg) => {
+        const snapshot = unpack(cache?.[FIELD]);
+        const allSave = GM_getValue('tgdd_is_all_save_mode', false) || GM_getValue('tgdd_last_run_options', {}).allSave;
+        if (!snapshot || !cfg.historySheetId || snapshot.sheetId !== String(cfg.historySheetId).trim() || allSave) return original(cache, cfg);
+        let done = false;
+        const finish = saved => {
+            if (done) return;
+            done = true;
+            if (saved) {
+                const key = String(cfg.historySheetId).trim();
+                historyBySheet.set(key, { ...(historyBySheet.get(key) || {}), [snapshot.date]: snapshot });
+                ui.showToast('Đã lưu BI theo ngày vào Sheet khai báo.', 3000);
+            } else ui.showToast('BI đã lấy xong; chưa lưu được vào Google Sheet.', 5000);
+            original(cache, cfg);
+        };
+        ui.showToast('Đang lưu BI theo ngày vào Google Sheet…', 0);
+        setTimeout(() => finish(false), 18000);
+        data.saveHistoryToSheet(cache, cfg, finish, displayDate(snapshot.date));
+    });
+
+    data.healthBI = { version: VERSION, shopList, isoDate, previousDay, previousMonthDate, pack, unpack, fromRecord, historyMap, mergeCatalog, metricFor, valuesFor, readPage, collectSnapshot, attachSnapshot, driver, rowsHTML, tableHTML, pieHTML, viewModel, loadHistory };
+})(_0x1c5250, _0x36259b, _0x432e89, _0x1221a3, hook => {
+    const original = _0x3429b9;
+    _0x3429b9 = (cache, cfg) => hook(original, cache, cfg);
+});
+// AUTOBI_HEALTH_BI_END
 
 _0x565350["init"]();}());
