@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.6.0
+// @version      1.6.1
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @homepageURL  https://github.com/nnnluv7/autobifree
@@ -342,21 +342,26 @@
 })(_0x2aa741, _0x1c5250, _0x432e89, _0x1221a3, state => { _0x4dbbf5 = state; });
 // CHILL14_CUSTOM_END
 
-// HEALTH_BI_V2_START
-// Read the BI hierarchy as displayed; never infer unavailable columns or add parents to children.
+// HEALTH_BI_V3_START
+// Use the shared declaration and read both months directly from the same BI source.
 (function installHealthBI(data, ui, utils, constants) {
     'use strict';
-    const SETTINGS = 'tgdd_health_bi_options_v2';
-    const VERSION = 2;
+    const VERSION = 3;
     const text = node => (node && (node.innerText || node.textContent) || '').replace(/\s+/g, ' ').trim();
     const slug = value => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/gi, 'd').toLowerCase().replace(/[^a-z0-9]/g, '');
     const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-    const visible = node => !!node && !node.hidden && node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden';
-    const buttons = () => Array.from(document.querySelectorAll('button')).filter(visible);
-    const shopKeys = config => ['shop1','shop2','shop3','shop4','shop5'].filter(key => String(config[key] || '').trim());
-    const signature = config => shopKeys(config).map(key => key + ':' + slug(config[key])).join('|');
     const finite = value => typeof value === 'number' && Number.isFinite(value);
+    const visible = node => !!node && !node.hidden && node.getClientRects().length > 0 && getComputedStyle(node).visibility !== 'hidden';
+    const sourceNode = node => !node.closest('.sk-health-v3, #capture-area, #tgdd-config-modal');
+    const buttons = () => Array.from(document.querySelectorAll('button')).filter(node => visible(node) && sourceNode(node));
+    const shopKeys = config => ['shop1','shop2','shop3','shop4','shop5'].filter(key => String(config[key] || '').trim());
+    const shopCode = (config, key) => String(config['shopCode' + key.slice(4)] || config['makho' + key.slice(4)] || '').trim();
+    const signature = config => JSON.stringify(shopKeys(config).map(key => [key, slug(config[key]), shopCode(config, key), slug(config[key + 'Short'])]));
+    // No separate selection: every configured store participates, just like the other tabs.
+    const options = config => ({ shops: shopKeys(config), mode: 'converted' });
+    const metricKey = mode => mode === 'actual' ? 'dt_thuc' : 'dtqd';
+    const format = (value, digits = 2) => finite(value) ? new Intl.NumberFormat('en-US', { maximumFractionDigits: digits }).format(value) : '—';
 
     function number(value, percent = false) {
         let s = String(value ?? '').trim().replace(/\u2212/g, '-');
@@ -371,15 +376,6 @@
         } else if (!percent && /^-?\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, '');
         const result = Number(s);
         return Number.isFinite(result) ? (negative ? -result : result) : null;
-    }
-    function options(config) {
-        let saved = GM_getValue(SETTINGS, {});
-        if (typeof saved === 'string') { try { saved = JSON.parse(saved); } catch (_) { saved = {}; } }
-        const keys = shopKeys(config);
-        return {
-            shops: saved && saved.signature === signature(config) && Array.isArray(saved.shops) ? keys.filter(key => saved.shops.includes(key)) : keys,
-            mode: saved && saved.mode === 'actual' ? 'actual' : 'converted'
-        };
     }
     function isActive(button) {
         return !!button && (button.getAttribute('aria-selected') === 'true' || button.getAttribute('aria-pressed') === 'true'
@@ -407,14 +403,14 @@
         return last.map((_, i) => [...new Set(grid.map(row => row[i]).filter(Boolean))].join(' / '));
     }
     function industryTable() {
-        return Array.from(document.querySelectorAll('table')).filter(visible).find(table => {
+        return Array.from(document.querySelectorAll('table')).filter(node => visible(node) && sourceNode(node)).find(table => {
             const headings = tableHeaders(table).map(slug);
             return headings.some(value => /nganhhang|nhomhang/.test(value)) && headings.some(value => /doanhthu|^dt/.test(value));
         });
     }
     function columnInfo(label, index, mode) {
         const key = slug(label);
-        if (/nganhhang|nhomhang/.test(key)) return { key: 'name', index, label: 'Ngành hàng / Nhóm hàng BI' };
+        if (/nganhhang|nhomhang/.test(key)) return { key: 'name', index, label };
         let field = 'source_' + index;
         const percent = /%/.test(label) || /titrong|tytrong|tangtruong|growth|pct|tyle|tile/.test(key);
         if (/soluong/.test(key)) field = 'sl';
@@ -424,20 +420,17 @@
         else if (/dukien/.test(key)) field = 'forecast';
         else if (/doanhthuquydoi|doanhthuqd|dtquydoi|dtqd/.test(key)) field = 'dtqd';
         else if (/doanhthuthuc|dtthuc/.test(key)) field = 'dt_thuc';
-        else if (/^(doanhthu|dt)$/.test(key)) field = mode === 'actual' ? 'dt_thuc' : 'dtqd';
+        else if (/^(doanhthu|dt)(trieudong|trieu|trd)?$/.test(key)) field = metricKey(mode);
         else if (/titrong|tytrong/.test(key)) field = 'share';
-        const display = /^(doanhthu|dt)$/.test(key) ? (mode === 'actual' ? 'Doanh thu thực' : 'Doanh thu QĐ') : label;
-        return { key: field, index, label: display, percent: percent || field === 'growth' };
+        return { key: field, index, label, percent: percent || field === 'growth' };
     }
     function parseTable(table, mode) {
         const columns = tableHeaders(table).map((label, i) => columnInfo(label, i, mode));
         const nameColumn = columns.find(col => col.key === 'name');
-        if (!nameColumn) throw new Error('Không nhận diện được tiêu đề Ngành hàng BI.');
+        if (!nameColumn || !columns.some(col => col.key === metricKey(mode))) throw new Error('Không nhận diện được cột ngành hàng và doanh thu BI.');
         const used = new Set();
         columns.forEach(col => { if (used.has(col.key)) col.key += '_' + col.index; used.add(col.key); });
-        let parent = '';
-        const seen = new Set();
-        const rows = [];
+        const seen = new Set(), rows = [], parents = [];
         table.querySelectorAll('tbody tr').forEach(row => {
             if (row.classList.contains('ant-table-measure-row') || row.classList.contains('ant-table-summary')) return;
             const cells = Array.from(row.children).filter(cell => /^(TD|TH)$/.test(cell.tagName));
@@ -452,43 +445,97 @@
             const indent = cell.querySelector('.ant-table-row-indent');
             let depth = level ? Number(level[1]) : row.hasAttribute('aria-level') ? Math.max(0, Number(row.getAttribute('aria-level')) - 1)
                 : indent ? Math.round((parseFloat(indent.style.paddingLeft || indent.style.width) || 0) / 15)
-                : /^p-/.test(rowKey) || toggle ? 0 : parent ? 1 : 0;
+                : /^p-/.test(rowKey) || toggle ? 0 : parents.length ? 1 : 0;
             depth = Math.min(5, Math.max(0, depth));
-            if (depth === 0) parent = name;
-            const id = rowKey || parent + '|' + rawName;
-            if (seen.has(id)) return;
+            const code = rawName.match(/^\s*[+−–-]?\s*(\d+)\s*[-–]/)?.[1];
+            const parentKey = depth ? parents[depth - 1] || '' : '';
+            const key = parentKey + '/' + (code ? 'code:' + code : 'name:' + slug(name));
+            parents[depth] = key;
+            parents.length = depth + 1;
+            if (seen.has(key)) return;
             const values = {};
             columns.filter(col => col.key !== 'name').forEach(col => { values[col.key] = number(text(cells[col.index]), col.percent); });
-            // A real zero is data; missing/dash cells remain null.
-            if (!Object.values(values).some(finite)) return;
-            seen.add(id);
-            rows.push({ id, name, depth, values });
+            seen.add(key);
+            rows.push({ id: rowKey || key, key, parentKey, name, depth, values });
         });
-        const available = columns.filter(col => col.key !== 'name' && rows.some(row => finite(row.values[col.key])));
-        return { columns: available, rows };
+        if (rows.length && !rows.some(row => finite(row.values[metricKey(mode)]))) throw new Error('Cột doanh thu BI chưa có số liệu đọc được.');
+        return { columns: columns.filter(col => col.key !== 'name'), rows, complete: true };
     }
     function busy() {
-        return Array.from(document.querySelectorAll('.ant-spin-spinning, .loading, .spinner, [aria-busy="true"]')).some(visible)
+        return Array.from(document.querySelectorAll('.ant-spin-spinning, .loading, .spinner, [aria-busy="true"]')).some(node => visible(node) && sourceNode(node))
             || buttons().some(button => slug(text(button)) === 'tailai' && button.disabled);
     }
     async function ready(requireIndustry = false, minimum = 1600) {
         const start = Date.now();
         let previous = '', stableAt = Date.now();
         while (Date.now() - start < 25000) {
-            const table = requireIndustry ? industryTable() : Array.from(document.querySelectorAll('table')).find(visible);
+            const table = requireIndustry ? industryTable() : Array.from(document.querySelectorAll('table')).find(node => visible(node) && sourceNode(node));
             const current = table ? text(table) : '';
             if (current !== previous || busy()) { previous = current; stableAt = Date.now(); }
             if (table && !busy() && Date.now() - start >= minimum && Date.now() - stableAt >= 700) return table;
             await sleep(180);
         }
-        throw new Error('Bảng BI chưa tải xong. Anh kiểm tra trang nguồn rồi chạy lại Lũy kế.');
+        throw new Error('Bảng BI chưa tải xong. Chạy lại Lũy kế hoặc Toàn bộ để cập nhật.');
     }
     async function selectTab(label) {
         const button = buttons().find(button => slug(text(button)) === slug(label));
         if (!button) throw new Error('Không tìm thấy nút ' + label + ' trên trang nguồn.');
         if (!isActive(button)) { button.click(); await ready(false); }
-        const selected = buttons().find(candidate => slug(text(candidate)) === slug(label));
-        if (!isActive(selected)) throw new Error('Chưa xác nhận được lựa chọn ' + label + '.');
+        if (!isActive(buttons().find(candidate => slug(text(candidate)) === slug(label)))) throw new Error('Chưa xác nhận được lựa chọn ' + label + '.');
+    }
+    function parseMonth(value) {
+        const s = String(value || '').trim();
+        let match = s.match(/^(\d{4})-(\d{1,2})$/), year, month;
+        if (match) { year = Number(match[1]); month = Number(match[2]); }
+        else if ((match = s.match(/^(\d{1,2})[\/.-](\d{4})$/))) { month = Number(match[1]); year = Number(match[2]); }
+        if (!year || month < 1 || month > 12) return null;
+        return { year, month, key: year + '-' + String(month).padStart(2, '0'), label: String(month).padStart(2, '0') + '/' + year };
+    }
+    function monthInput() {
+        return Array.from(document.querySelectorAll('input[type="month"], .ant-picker input')).find(node => visible(node) && sourceNode(node) && (node.type === 'month' || parseMonth(node.value)));
+    }
+    function reportPeriods(now = new Date(), context = null) {
+        const stored = GM_getValue('tgdd_custom_report_month', 'current');
+        const selected = stored !== 'current' ? parseMonth(stored) : null;
+        const date = String(context || '').match(/^\d{1,2}\/(\d{1,2})\/(\d{4})$/);
+        const current = selected || (date && parseMonth(date[1] + '/' + date[2])) || parseMonth(now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0'));
+        const previousDate = new Date(current.year, current.month - 2, 1);
+        const previous = parseMonth(previousDate.getFullYear() + '-' + String(previousDate.getMonth() + 1).padStart(2, '0'));
+        return { current, previous };
+    }
+    async function selectMonth(period) {
+        let input = monthInput();
+        if (!input) throw new Error('Không đọc được bộ chọn tháng của trang nguồn.');
+        if (parseMonth(input.value)?.key === period.key) return;
+        if (input.type === 'month') {
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, period.key);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        } else {
+            input.click();
+            let chosen = false;
+            for (let attempt = 0; attempt < 30; attempt++) {
+                await sleep(120);
+                const panel = Array.from(document.querySelectorAll('.ant-picker-dropdown')).find(visible);
+                if (!panel) continue;
+                const cell = Array.from(panel.querySelectorAll('td[title]')).find(node => visible(node) && node.getAttribute('title') === period.key && !node.classList.contains('ant-picker-cell-disabled'));
+                if (cell) { (cell.querySelector('.ant-picker-cell-inner') || cell).click(); chosen = true; break; }
+                const yearButton = panel.querySelector('.ant-picker-year-btn');
+                const year = Number(text(yearButton).match(/\d{4}/)?.[0]);
+                if (!year || year === period.year) continue;
+                const direction = year < period.year ? 'next' : 'prev';
+                const arrow = panel.querySelector('.ant-picker-header-super-' + direction + '-btn');
+                if (!arrow || arrow.disabled) break;
+                arrow.click();
+            }
+            if (!chosen) { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); throw new Error('Không chọn được tháng ' + period.label + '.'); }
+        }
+        await sleep(200);
+        const reload = buttons().find(button => slug(text(button)) === 'tailai');
+        if (reload && !reload.disabled) reload.click();
+        await ready(false, 2200);
+        input = monthInput();
+        if (parseMonth(input?.value)?.key !== period.key) throw new Error('Tháng trên trang nguồn chưa khớp ' + period.label + '.');
     }
     function shopTrigger() {
         return buttons().find(button => Array.from(button.querySelectorAll('span')).some(span => slug(text(span)) === 'sieuthi'))
@@ -514,8 +561,7 @@
             const found = dropdown();
             if (found) {
                 if (found.search.value) {
-                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                    setter.call(found.search, '');
+                    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(found.search, '');
                     found.search.dispatchEvent(new Event('input', { bubbles: true }));
                     await sleep(250);
                 }
@@ -530,38 +576,38 @@
         if (!panel) return [];
         return Array.from(panel.root.querySelectorAll('input[type="checkbox"], [role="checkbox"]')).filter(input => visible(input) || visible(input.closest('label'))).map(input => {
             let holder = input.closest('label, [role="option"], li') || input.parentElement;
-            while (holder && holder !== panel.root && !/\d{3,}\s*[-–]/.test(text(holder))) {
+            while (holder && holder !== panel.root && !/(?:^|\s)\d+\s*[-–]/.test(text(holder))) {
                 const next = holder.parentElement;
                 if (!next || next === panel.root || next.querySelectorAll('input[type="checkbox"], [role="checkbox"]').length !== 1) break;
                 holder = next;
             }
             const label = text(holder);
-            const match = label.match(/(?:^|\s)(\d{3,})\s*[-–]/);
+            const match = label.match(/(?:^|\s)(\d+)\s*[-–]/);
             return { input, label, id: match ? match[1] : '', checked: input.checked === true || input.getAttribute('aria-checked') === 'true' || input.getAttribute('data-state') === 'checked' };
         }).filter(choice => choice.id);
     }
     function resolveShop(config, key, choices) {
-        const full = String(config[key] || '');
-        const short = String(config[key + 'Short'] || '');
-        const ids = full.match(/\d{3,}/g) || [];
-        let matches = choices.filter(choice => ids.includes(choice.id));
-        if (!matches.length) {
-            const names = [full, short, full.split(/\s+-\s+/).pop()].map(slug).filter(value => value.length >= 4);
-            matches = choices.filter(choice => names.some(name => slug(choice.label).endsWith(name) || slug(choice.label).includes(name)));
+        const full = String(config[key] || '').trim(), short = String(config[key + 'Short'] || '').trim();
+        const declared = shopCode(config, key) || full.match(/^\s*(\d+)\s*[-–]/)?.[1];
+        let matches;
+        if (declared) matches = choices.filter(choice => choice.id === declared);
+        else {
+            const exact = choices.filter(choice => slug(choice.label) === slug(full) || slug(choice.label.replace(/^\d+\s*[-–]\s*/, '')) === slug(full));
+            const names = [full, short, full.split(/\s+[-–]\s+/).pop()].map(slug).filter(value => value.length >= 4);
+            matches = exact.length ? exact : choices.filter(choice => names.some(name => slug(choice.label).endsWith(name)));
         }
-        if (matches.length !== 1) throw new Error('Không xác định duy nhất siêu thị: ' + (short || full) + '. Kiểm tra tên/mã trong Khai báo.');
-        return { key, id: matches[0].id, label: matches[0].label };
+        if (matches.length !== 1) throw new Error('Không xác định duy nhất siêu thị: ' + (short || full || declared) + '. Kiểm tra tên/mã trong Khai báo.');
+        return { key, id: matches[0].id, label: short || full || matches[0].label };
     }
     async function setShops(ids) {
         await openShops();
         const desired = new Set(ids);
-        for (let i = 0; i < 100; i++) {
+        for (let i = 0; i < 150; i++) {
             const choices = shopChoices();
-            if (!ids.every(id => choices.some(choice => choice.id === id))) throw new Error('Siêu thị cần lấy dữ liệu không có trong danh sách hiện tại.');
+            if (!ids.every(id => choices.some(choice => choice.id === id))) throw new Error('Siêu thị khai báo không có trong bộ lọc hiện tại.');
             const change = choices.find(choice => choice.checked !== desired.has(choice.id));
             if (!change) {
-                const actual = choices.filter(choice => choice.checked).map(choice => choice.id);
-                if (actual.length !== ids.length) throw new Error('Bộ lọc Siêu thị chưa đúng phạm vi.');
+                if (choices.filter(choice => choice.checked).length !== ids.length) throw new Error('Bộ lọc Siêu thị chưa đúng phạm vi.');
                 shopTrigger().click();
                 await sleep(150);
                 const reload = buttons().find(button => slug(text(button)) === 'tailai');
@@ -582,33 +628,37 @@
     async function readIndustry(mode) {
         const tab = buttons().find(button => /^(nganhhangbi|nganhhang)$/.test(slug(text(button))));
         if (!tab) throw new Error('Không tìm thấy tab Ngành hàng BI.');
-        if (!isActive(tab)) tab.click();
-        await ready(true);
-        for (const label of ['titrong', 'tytrong', 'tangtruong', 'dukien', 'chitietdoanhthu']) {
-            const option = buttons().find(button => slug(text(button)) === label);
-            if (!option || option.disabled) continue;
-            const selected = option.getAttribute('aria-pressed') === 'true' || option.querySelector('input:checked')
-                || /\bbg-blue-50\b/.test(option.className) || option.querySelector('svg.lucide-square-check, svg.lucide-square-check-big');
-            if (!selected) { option.click(); await ready(true, 800); }
-        }
-        // One click per expansion, including new BI IDs (3, 9, 7, ...).
+        if (!isActive(tab)) { tab.click(); await ready(true); }
         for (let i = 0; i < 150; i++) {
-            const table = industryTable();
-            const next = table && collapsedButtons(table)[0];
+            const table = industryTable(), next = table && collapsedButtons(table)[0];
             if (!next) break;
             next.click();
             await sleep(220);
-            if (i === 149) throw new Error('Chưa bung hết các nhóm hàng BI.');
         }
         const table = await ready(true, 800);
-        const result = parseTable(table, mode);
-        if (!result.rows.length) throw new Error('Nguồn chưa có dòng ngành hàng có số liệu cho lựa chọn này.');
-        return result;
+        if (collapsedButtons(table).length) throw new Error('Chưa bung hết các nhóm hàng BI.');
+        return parseTable(table, mode);
+    }
+    async function withRetries(action) {
+        let last;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try { return await action(); }
+            catch (error) {
+                last = error;
+                if (attempt < 2) {
+                    if (dropdown()) shopTrigger()?.click();
+                    const reload = buttons().find(button => slug(text(button)) === 'tailai');
+                    if (reload && !reload.disabled) reload.click();
+                    await sleep(500);
+                }
+            }
+        }
+        throw last;
     }
     function legacyRows(snapshot) {
         const map = {};
         const aliases = { dienthoai: 'Smartphone', maysaylongngang: 'Máy sấy', mayhutbuirobot: 'Hút bụi Robot' };
-        for (const row of snapshot.rows || []) {
+        for (const row of snapshot?.rows || []) {
             const key = aliases[slug(row.name)] || row.name;
             if (!Object.prototype.hasOwnProperty.call(map, key)) map[key] = {
                 sl: row.values.sl ?? null, dtqd: row.values.dtqd ?? null, dt_thuc: row.values.dt_thuc ?? null,
@@ -617,62 +667,86 @@
         }
         return map;
     }
-    function saveScope(key, snapshot) {
+    function savePeriod(key, period, snapshot, details) {
         const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {};
-        cache.health_bi ||= { version: VERSION, scopes: {} };
-        cache.health_bi.scopes[key] = snapshot;
-        cache.link8_health ||= {};
-        cache.link8_health[key] = snapshot.error ? {} : legacyRows(snapshot);
+        cache.health_bi.scopes[key] ||= { ...details, mode: 'converted', periods: {} };
+        cache.health_bi.scopes[key].periods[period] = { ...snapshot, collectedAt: new Date().toISOString() };
+        if (period === 'current') {
+            cache.link8_health ||= {};
+            cache.link8_health[key] = snapshot.error ? {} : legacyRows(snapshot);
+        }
         GM_setValue(constants.KEYS.DATA_CACHE, cache);
     }
-    let running = null;
     async function collect(config) {
-        const setting = options(config);
+        const setting = options(config), periods = reportPeriods();
         const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {};
-        cache.health_bi = { version: VERSION, scopes: {}, signature: signature(config) };
+        cache.health_bi = { version: VERSION, signature: signature(config), periods, scopes: {} };
         cache.link8_health = {};
         GM_setValue(constants.KEYS.DATA_CACHE, cache);
-        let initial = null, originalMode = null;
-        const pending = ['total', ...setting.shops];
+        let initial = null, originalMonth = null;
+        const activeLabel = names => { const button = buttons().find(button => names.includes(slug(text(button))) && isActive(button)); return button ? text(button) : null; };
+        const originalMode = activeLabel(['dtthuc', 'dtquydoi']);
+        const originalTab = activeLabel(['doanhthu', 'tonghop', 'nganhhangbi', 'nganhhang', 'nhanvien', 'chiphi', 'thidua']);
+        const originalRollup = activeLabel(['luyke', 'realtime']);
         try {
-            if (!setting.shops.length) throw new Error('Chọn ít nhất một siêu thị trong Dữ liệu SKST / Khai báo.');
-            originalMode = buttons().find(button => /^(dtthuc|dtquydoi)$/.test(slug(text(button))) && isActive(button));
-            originalMode = originalMode ? text(originalMode) : null;
+            if (!setting.shops.length) throw new Error('Chưa có siêu thị trong Khai báo.');
+            originalMonth = parseMonth(monthInput()?.value);
+            if (!originalMonth) throw new Error('Không xác nhận được tháng của trang nguồn.');
             await openShops();
             const choices = shopChoices();
-            if (!choices.length) throw new Error('Không đọc được danh sách siêu thị.');
             initial = choices.filter(choice => choice.checked).map(choice => choice.id);
-            const stores = setting.shops.map(key => resolveShop(config, key, choices));
-            if (new Set(stores.map(store => store.id)).size !== stores.length) throw new Error('Hai siêu thị khai báo đang trùng mã.');
+            if (!choices.length) throw new Error('Không đọc được danh sách siêu thị.');
+            const stores = [], errors = new Map();
+            for (const key of setting.shops) {
+                try { stores.push(resolveShop(config, key, choices)); }
+                catch (error) { errors.set(key, error.message); }
+            }
+            for (const store of stores) {
+                if (stores.filter(other => other.id === store.id).length > 1) errors.set(store.key, 'Mã siêu thị bị trùng trong Khai báo: ' + store.id + '.');
+            }
             shopTrigger().click();
+            const scopes = [{ key: 'total', stores, label: config.cluster || 'Tổng cụm', error: errors.size ? 'Chưa xác định đủ siêu thị trong Khai báo.' : null },
+                ...setting.shops.map(key => ({ key, stores: stores.filter(store => store.key === key), label: config[key + 'Short'] || config[key], error: errors.get(key) }))];
             await selectTab('Lũy kế');
-            await selectTab(setting.mode === 'actual' ? 'DT thực' : 'DT quy đổi');
-            const scopes = [{ key: 'total', stores }, ...stores.map(store => ({ key: store.key, stores: [store] }))];
-            for (const scope of scopes) {
-                const label = scope.key === 'total' ? 'Tổng cụm (' + stores.length + ' siêu thị)' : scope.stores[0].label;
-                ui.showToast('Đang lấy ngành hàng BI: ' + label + '...', 0);
-                try {
-                    await setShops(scope.stores.map(store => store.id));
-                    const snapshot = await readIndustry(setting.mode);
-                    saveScope(scope.key, { ...snapshot, label, stores: scope.stores, mode: setting.mode, collectedAt: new Date().toISOString() });
-                } catch (error) {
-                    saveScope(scope.key, { error: error.message, label, stores: scope.stores, rows: [], columns: [] });
+            await selectTab('DT quy đổi');
+            for (const [periodKey, period] of Object.entries(periods)) {
+                let monthError = null;
+                try { await withRetries(() => selectMonth(period)); } catch (error) { monthError = error.message; }
+                for (const scope of scopes) {
+                    ui.showToast('Sức khỏe ST · ' + period.label + ' · ' + scope.label + '...', 0);
+                    try {
+                        if (scope.error || monthError) throw new Error(scope.error || monthError);
+                        const snapshot = await withRetries(async () => {
+                            await setShops(scope.stores.map(store => store.id));
+                            await selectTab('Lũy kế');
+                            await selectTab('DT quy đổi');
+                            const result = await readIndustry(setting.mode);
+                            if (parseMonth(monthInput()?.value)?.key !== period.key) throw new Error('Tháng trên trang nguồn đã thay đổi trong khi lấy dữ liệu.');
+                            return result;
+                        });
+                        savePeriod(scope.key, periodKey, { ...snapshot, period }, scope);
+                    } catch (error) { savePeriod(scope.key, periodKey, { error: error.message, period, rows: [] }, scope); }
                 }
             }
         } catch (error) {
-            pending.forEach(key => saveScope(key, { error: error.message, rows: [], columns: [] }));
+            for (const key of ['total', ...setting.shops]) for (const [periodKey, period] of Object.entries(periods)) {
+                savePeriod(key, periodKey, { error: error.message, period, rows: [] }, { label: key === 'total' ? config.cluster || 'Tổng cụm' : config[key + 'Short'] || config[key] });
+            }
         } finally {
-            try {
-                if (initial) await setShops(initial);
-                if (originalMode) await selectTab(originalMode);
-            } catch (error) { console.warn('[SKST] Không khôi phục được bộ lọc:', error.message); }
+            // Restore each control independently; a failed restore must not stop the report queue.
+            if (dropdown()) shopTrigger()?.click();
+            for (const restore of [() => originalMonth && selectMonth(originalMonth), () => initial && setShops(initial),
+                () => originalMode && selectTab(originalMode), () => originalRollup && selectTab(originalRollup), () => originalTab && selectTab(originalTab)]) {
+                try { await restore(); } catch (error) { console.warn('[SKST] Không khôi phục được bộ lọc:', error.message); }
+            }
             const result = GM_getValue(constants.KEYS.DATA_CACHE, {})?.health_bi;
-            const failures = Object.values(result?.scopes || {}).filter(scope => scope.error).length;
-            ui.showToast(failures ? 'Có phạm vi chưa lấy được ngành hàng. Xem thông báo trong Sức khỏe ST.' : 'Đã lấy ngành hàng Tổng cụm và từng siêu thị.', 5000);
+            const failures = Object.values(result?.scopes || {}).some(scope => Object.values(scope.periods || {}).some(period => period.error));
+            ui.showToast(failures ? 'Đã hoàn tất Sức khỏe ST; có tháng chưa lấy được số liệu. Xem thông báo trong bảng.' : 'Đã lấy Sức khỏe ST hai tháng theo Khai báo.', 6000);
         }
     }
+    let running = null;
     data.collectHealthCategoriesByShopDMX = function (config, callback) {
-        if (!running) running = collect(config).finally(() => { running = null; });
+        if (!running) running = collect(JSON.parse(JSON.stringify(config))).catch(error => console.warn('[SKST]', error)).finally(() => { running = null; });
         return running.then(() => { if (typeof callback === 'function') callback(); });
     };
     data.scrapeHealthCategoriesDMX = function (callback) {
@@ -683,162 +757,181 @@
         }).catch(error => { ui.showToast(error.message, 6000); if (typeof callback === 'function') callback({}); });
     };
 
-    const originalHealth = ui.HTML.getHealthReport;
-    function renderCategories(snapshot) {
-        if (!snapshot || snapshot.error) return '<div class="sk-bi-empty">' + escape(snapshot?.error || 'Chưa có dữ liệu ngành hàng theo từng siêu thị. Chạy lại báo cáo Lũy kế hoặc Toàn bộ sau khi cập nhật.') + '</div>';
-        const columns = snapshot.columns.filter(col => snapshot.rows.some(row => finite(row.values[col.key])));
-        const format = (value, percent) => finite(value) ? new Intl.NumberFormat('en-US', { maximumFractionDigits: percent ? 2 : 2 }).format(value) + (percent ? '%' : '') : '—';
-        return '<table class="sk-inner-table sk-bi-table" data-table-name="Ngành hàng BI"><thead><tr><th>Ngành hàng / Nhóm hàng BI</th>'
-            + columns.map(col => '<th>' + escape(col.label) + '</th>').join('') + '</tr></thead><tbody>'
-            + snapshot.rows.map(row => '<tr class="' + (row.depth === 0 ? 'sk-bi-parent' : '') + '"><td style="padding-left:' + (8 + row.depth * 14) + 'px">' + escape(row.name) + '</td>'
-                + columns.map(col => '<td' + (col.key === 'growth' && finite(row.values[col.key]) ? ' style="color:' + (row.values[col.key] < 0 ? '#dc2626' : '#15803d') + '"' : '') + '>' + format(row.values[col.key], col.percent) + '</td>').join('') + '</tr>').join('')
-            + '</tbody></table>';
+    function validPeriod(snapshot) { return !!snapshot && !snapshot.error && snapshot.complete === true && Array.isArray(snapshot.rows) && Array.isArray(snapshot.columns); }
+    function mergePeriods(current, previous) {
+        const map = new Map();
+        for (const [period, snapshot] of [['current', current], ['previous', previous]]) {
+            if (!validPeriod(snapshot)) continue;
+            for (const row of snapshot.rows) {
+                if (!map.has(row.key)) map.set(row.key, { key: row.key, parentKey: row.parentKey, name: row.name, depth: row.depth });
+                map.get(row.key)[period] = row.values;
+            }
+        }
+        const children = new Map();
+        for (const row of map.values()) {
+            const parent = map.has(row.parentKey) ? row.parentKey : '';
+            if (!children.has(parent)) children.set(parent, []);
+            children.get(parent).push(row);
+        }
+        const result = [];
+        function walk(key) { for (const row of children.get(key) || []) { result.push(row); walk(row.key); } }
+        walk('');
+        return result;
     }
-    function chart(snapshot) {
-        if (!snapshot || snapshot.error) return '';
-        const metric = snapshot.mode === 'actual' ? 'dt_thuc' : 'dtqd';
-        const roots = snapshot.rows.filter(row => row.depth === 0 && finite(row.values[metric]) && row.values[metric] > 0);
-        const total = roots.reduce((sum, row) => sum + row.values[metric], 0);
-        if (!total) return '';
-        return '<div class="sk-bi-chart"><b>Tỷ trọng ' + (snapshot.mode === 'actual' ? 'DT thực' : 'DTQĐ') + ' theo ngành</b>'
-            + roots.map(row => '<div class="sk-bi-bar"><span>' + escape(row.name) + '</span><strong>' + (row.values[metric] / total * 100).toFixed(1) + '%</strong><i style="width:' + (row.values[metric] / total * 100).toFixed(2) + '%"></i></div>').join('') + '</div>';
+    function valueFor(row, field, period, snapshot) {
+        if (!validPeriod(snapshot)) return null;
+        if (row[period]) return row[period][field] ?? null;
+        // Absent categories in a successfully read, fully expanded month had no records.
+        return snapshot.columns.some(column => column.key === field) ? 0 : null;
     }
-    let lastConfig = {};
+    function delta(current, previous) {
+        if (!finite(current) || !finite(previous)) return { amount: null, percent: null };
+        return { amount: current - previous, percent: previous === 0 ? (current === 0 ? 0 : null) : (current - previous) / Math.abs(previous) * 100 };
+    }
+    function differenceCells(current, previous) {
+        const change = delta(current, previous);
+        const cls = !finite(change.amount) || change.amount === 0 ? '' : change.amount > 0 ? ' sk-up' : ' sk-down';
+        const signed = value => finite(value) ? (value > 0 ? '+' : '') + format(value) : '—';
+        const percent = previous === 0 && finite(current) && current !== 0 ? 'Mốc 0' : finite(change.percent) ? signed(change.percent) + '%' : '—';
+        return '<td class="sk-change' + cls + '">' + signed(change.amount) + '</td><td class="sk-change' + cls + '"' + (percent === 'Mốc 0' ? ' title="Tháng trước bằng 0; không tính được phần trăm tăng giảm."' : '') + '>' + percent + '</td>';
+    }
+    function renderCategories(scope, periods) {
+        const current = scope?.periods?.current, previous = scope?.periods?.previous;
+        const rows = mergePeriods(current, previous), field = metricKey(scope?.mode);
+        const notices = [['Tháng này', current], ['Tháng trước', previous]].filter(([, snapshot]) => !validPeriod(snapshot))
+            .map(([label, snapshot]) => '<p class="sk-bi-empty">' + label + ': ' + escape(snapshot?.error || 'Chưa có dữ liệu. Chạy lại Lũy kế hoặc Toàn bộ.') + '</p>').join('');
+        if (!rows.length) return notices || '<p class="sk-bi-empty">Hai tháng không có ngành hàng phát sinh trên trang nguồn.</p>';
+        const revenue = scope?.mode === 'actual' ? 'DT thực' : 'DTQĐ';
+        return notices + '<div class="sk-table-scroll" tabindex="0" role="region" aria-label="So sánh ngành hàng hai tháng"><table class="sk-inner-table sk-bi-table" data-table-name="Ngành hàng hai tháng">'
+            + '<colgroup><col class="sk-name-col"><col span="6"></colgroup><thead><tr><th rowspan="2" scope="col">Ngành hàng / Nhóm hàng BI</th>'
+            + '<th colspan="2" scope="colgroup" class="sk-month-now">Tháng này · ' + escape(periods.current.label) + '</th><th colspan="2" scope="colgroup" class="sk-month-prev">Tháng trước · ' + escape(periods.previous.label) + '</th>'
+            + '<th colspan="2" scope="colgroup" class="sk-month-change">Tăng / Giảm</th></tr><tr><th scope="col">SL</th><th scope="col">' + revenue + '</th><th scope="col">SL</th><th scope="col">' + revenue + '</th><th scope="col">Δ ' + revenue + '</th><th scope="col">%</th></tr></thead><tbody>'
+            + rows.map(row => '<tr' + (row.depth === 0 ? ' class="sk-bi-parent"' : '') + '><th scope="row" style="padding-left:' + (10 + row.depth * 13) + 'px">' + escape(row.name) + '</th>'
+                + '<td>' + format(valueFor(row, 'sl', 'current', current), 0) + '</td><td>' + format(valueFor(row, field, 'current', current)) + '</td>'
+                + '<td>' + format(valueFor(row, 'sl', 'previous', previous), 0) + '</td><td>' + format(valueFor(row, field, 'previous', previous)) + '</td>'
+                + differenceCells(valueFor(row, field, 'current', current), valueFor(row, field, 'previous', previous)) + '</tr>').join('')
+            + '</tbody></table></div>';
+    }
+    const PALETTE = ['#2563eb','#f97316','#16a34a','#9333ea','#eab308','#0891b2','#db2777','#64748b','#4f46e5','#0d9488','#b45309','#be123c'];
+    function pieData(snapshot, mode) {
+        if (!validPeriod(snapshot)) return null;
+        const roots = snapshot.rows.filter(row => row.depth === 0), field = metricKey(mode);
+        if (roots.some(row => !finite(row.values[field]))) return null;
+        return { roots, total: roots.reduce((sum, row) => sum + Math.max(0, row.values[field]), 0), negative: roots.some(row => row.values[field] < 0), field };
+    }
+    function renderPie(snapshot, mode, label, period, colors, legend) {
+        const model = pieData(snapshot, mode);
+        const heading = '<h3>' + label + ' <span>' + escape(period.label) + '</span></h3>';
+        if (!model) return '<section class="sk-pie-card">' + heading + '<p class="sk-bi-empty">' + escape(snapshot?.error || 'Chưa đủ dữ liệu để vẽ biểu đồ.') + '</p></section>';
+        if (!model.total) return '<section class="sk-pie-card">' + heading + '<p class="sk-bi-empty">Không có doanh thu dương để tính tỷ trọng.</p></section>';
+        let angle = -Math.PI / 2;
+        const slices = model.roots.filter(row => row.values[model.field] > 0).map(row => {
+            const share = row.values[model.field] / model.total, start = angle;
+            angle += share * Math.PI * 2;
+            const color = colors.get(row.key);
+            const title = '<title>' + escape(row.name + ': ' + format(share * 100) + '%') + '</title>';
+            if (share > 0.999999) return '<circle cx="80" cy="80" r="74" fill="' + color + '">' + title + '</circle>';
+            const point = a => (80 + Math.cos(a) * 74).toFixed(4) + ' ' + (80 + Math.sin(a) * 74).toFixed(4);
+            return '<path d="M 80 80 L ' + point(start) + ' A 74 74 0 ' + (share > 0.5 ? 1 : 0) + ' 1 ' + point(angle) + ' Z" fill="' + color + '" stroke="#fff" stroke-width="1">' + title + '</path>';
+        }).join('');
+        const values = new Map(model.roots.map(row => [row.key, row.values[model.field]]));
+        return '<section class="sk-pie-card">' + heading + '<div class="sk-pie-body"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" width="160" height="160" role="img" aria-label="Tỷ trọng doanh thu ' + label.toLowerCase() + '"><title>Tỷ trọng ' + escape(period.label) + '</title>' + slices + '</svg><ul class="sk-pie-legend">'
+            + legend.map(row => '<li><i style="background:' + colors.get(row.key) + '"></i><span>' + escape(row.name) + '</span><b>' + format(Math.max(0, values.get(row.key) || 0) / model.total * 100, 1) + '%</b></li>').join('')
+            + '</ul></div><p class="sk-pie-total">' + (mode === 'actual' ? 'DT thực' : 'DTQĐ') + ': <b>' + format(model.total) + '</b>' + (model.negative ? ' · Tỷ trọng tính trên doanh thu dương; giá trị âm xem trong bảng.' : '') + '</p></section>';
+    }
+    function renderCharts(scope, periods) {
+        const rows = mergePeriods(scope?.periods?.current, scope?.periods?.previous).filter(row => row.depth === 0);
+        const colors = new Map(rows.map((row, i) => [row.key, PALETTE[i % PALETTE.length]]));
+        return '<div class="sk-pies">' + renderPie(scope?.periods?.current, scope?.mode, 'Tháng này', periods.current, colors, rows)
+            + renderPie(scope?.periods?.previous, scope?.mode, 'Tháng trước', periods.previous, colors, rows) + '</div>';
+    }
+    function renderSummary(report, config, scope, targetBI) {
+        const keys = scope === 'total' ? shopKeys(config) : shopKeys(config).filter(key => key === scope);
+        const sum = field => keys.length && keys.every(key => finite(report?.link2?.[key]?.[field])) ? keys.reduce((total, key) => total + report.link2[key][field], 0) : null;
+        const actual = sum('dtlk'), revenue = sum('r');
+        const targets = keys.map(key => number(config['target' + key.slice(4)]));
+        const target = targetBI ? sum('t') : targets.length && targets.every(finite) ? targets.reduce((a, b) => a + b, 0) : null;
+        const rows = [['DT quy đổi', revenue], ['Target', target], ['% HT Target', target > 0 && finite(revenue) ? revenue / target * 100 : null, true],
+            ['DT thực', actual], ['Dự kiến DTQĐ', sum('dtqd_dk')], ['Hiệu quả QĐ', actual > 0 && finite(revenue) ? (revenue / actual - 1) * 100 : null, true]];
+        const installment = sum('tg');
+        if (finite(installment)) {
+            // Percentages need revenue weights when aggregating several stores.
+            const weights = keys.map(key => report?.link2?.[key]);
+            const ratio = actual > 0 ? weights.reduce((total, item) => total + item.tg * item.dtlk, 0) / actual : keys.length === 1 ? installment : null;
+            rows.push(['Tỷ trọng trả chậm', ratio, true]);
+        }
+        const profit = sum('lai_gop');
+        if (finite(profit)) rows.push(['Lợi nhuận', profit]);
+        const service = keys.map(key => report?.link9?.[key]);
+        if (service.length && service.every(item => item && finite(Number(item.score)))) rows.push(['Điểm hài lòng', service.reduce((total, item) => total + Number(item.score), 0) / service.length]);
+        return '<section class="sk-summary-card"><h3>Tổng quan tháng này</h3><table class="sk-summary-table" data-table-name="Tổng quan Sức khỏe ST"><tbody>'
+            + rows.map(([label, value, percent]) => '<tr><th scope="row">' + label + '</th><td>' + format(value) + (percent && finite(value) ? '%' : '') + '</td></tr>').join('') + '</tbody></table></section>';
+    }
+    const STYLES = `<style>
+        .sk-health-v3, .sk-health-v3 * { box-sizing:border-box; }
+        .sk-health-v3 { width:100%; max-width:1120px; min-width:0; margin:0 auto; color:#1e293b; background:#fff; border:1px solid #cbd5e1; border-radius:12px; font:12px/1.45 Arial,sans-serif; overflow:hidden; }
+        .sk-health-v3 .sk-health-header { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; padding:15px 18px; background:#f1f5f9; border-bottom:1px solid #e2e8f0; }
+        .sk-health-v3 .sk-health-title { margin:0; font-size:17px; font-weight:700; color:#0f172a; overflow-wrap:anywhere; }
+        .sk-health-v3 .sk-source { margin:5px 0 0; color:#64748b; font-size:11px; overflow-wrap:anywhere; }
+        .sk-health-v3 .sk-health-period { flex-shrink:0; text-align:right; font-size:11px; color:#475569; }
+        .sk-health-v3 .sk-health-top { display:grid; grid-template-columns:240px minmax(0,1fr); gap:14px; padding:16px; align-items:start; }
+        .sk-health-v3 .sk-pies { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; min-width:0; }
+        .sk-health-v3 .sk-summary-card, .sk-health-v3 .sk-pie-card { min-width:0; border:1px solid #e2e8f0; border-radius:9px; overflow:hidden; background:#fff; }
+        .sk-health-v3 h3 { margin:0; padding:10px 12px; background:#f8fafc; border-bottom:1px solid #e2e8f0; font-size:12px; font-weight:700; color:#334155; }
+        .sk-health-v3 h3 span { float:right; font-size:11px; font-weight:400; color:#64748b; }
+        .sk-health-v3 .sk-summary-table { border-collapse:collapse; width:100%; table-layout:fixed; font-size:11px; }
+        .sk-health-v3 .sk-summary-table th, .sk-health-v3 .sk-summary-table td { padding:7px 10px; border:0; border-bottom:1px solid #f1f5f9; height:auto; }
+        .sk-health-v3 .sk-summary-table th { width:62%; background:#fff; color:#475569; text-align:left; font-weight:400; white-space:normal; }
+        .sk-health-v3 .sk-summary-table td { text-align:right; font-weight:700; white-space:normal; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+        .sk-health-v3 .sk-pie-body { display:flex; flex-direction:column; align-items:center; gap:10px; padding:12px; }
+        .sk-health-v3 .sk-pie-body svg { width:140px; height:140px; max-width:100%; flex-shrink:0; }
+        .sk-health-v3 .sk-pie-legend { margin:0; padding:0; width:100%; list-style:none; }
+        .sk-health-v3 .sk-pie-legend li { display:grid; grid-template-columns:9px minmax(0,1fr) auto; align-items:start; gap:6px; padding:3px 0; font-size:10px; line-height:1.4; }
+        .sk-health-v3 .sk-pie-legend i { width:9px; height:9px; border-radius:2px; margin-top:2px; }
+        .sk-health-v3 .sk-pie-legend span { overflow-wrap:anywhere; } .sk-health-v3 .sk-pie-legend b { white-space:nowrap; font-variant-numeric:tabular-nums; }
+        .sk-health-v3 .sk-pie-total { margin:0; padding:8px 12px; border-top:1px solid #f1f5f9; color:#64748b; font-size:10px; }
+        .sk-health-v3 .sk-comparison { padding:0 16px 16px; min-width:0; }
+        .sk-health-v3 .sk-section-title { margin:0 0 9px; padding:0; border:0; background:none; font-size:13px; }
+        .sk-health-v3 .sk-table-scroll { overflow-x:auto; width:100%; border:1px solid #e2e8f0; border-radius:8px; }
+        .sk-health-v3 .sk-bi-table { width:100%; min-width:720px; border-collapse:collapse; table-layout:auto; height:auto; margin:0; font-size:11px; }
+        .sk-health-v3 .sk-name-col { width:34%; }
+        .sk-health-v3 .sk-bi-table th, .sk-health-v3 .sk-bi-table td { border:1px solid #e2e8f0; padding:7px 8px; height:auto; line-height:1.45; vertical-align:middle; color:#334155; }
+        .sk-health-v3 .sk-bi-table thead th { background:#f1f5f9; font-weight:700; white-space:normal; text-align:center; }
+        .sk-health-v3 .sk-bi-table .sk-month-now { background:#e0f2fe; color:#075985; }
+        .sk-health-v3 .sk-bi-table .sk-month-prev { background:#ede9fe; color:#5b21b6; }
+        .sk-health-v3 .sk-bi-table .sk-month-change { background:#fff7ed; color:#9a3412; }
+        .sk-health-v3 .sk-bi-table tbody th { text-align:left; white-space:normal; overflow-wrap:anywhere; font-weight:400; background:#fff; }
+        .sk-health-v3 .sk-bi-table td { text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }
+        .sk-health-v3 .sk-bi-table .sk-bi-parent th, .sk-health-v3 .sk-bi-table .sk-bi-parent td { background:#f3f0ff; font-weight:700; }
+        .sk-health-v3 .sk-bi-table .sk-change { font-weight:700; } .sk-health-v3 .sk-bi-table .sk-up { color:#15803d; } .sk-health-v3 .sk-bi-table .sk-down { color:#dc2626; }
+        .sk-health-v3 .sk-bi-empty { margin:0; padding:14px 12px; background:#fffbeb; color:#92400e; font-size:11px; overflow-wrap:anywhere; }
+        .sk-health-v3 .sk-health-note { margin:10px 0 0; font-size:10px; color:#64748b; line-height:1.6; }
+        @media (max-width:900px) { .sk-health-v3 .sk-health-top { grid-template-columns:1fr; } .sk-health-v3 .sk-summary-table th { width:auto; } }
+        @media (max-width:560px) { .sk-health-v3 .sk-health-header { flex-direction:column; gap:7px; padding:12px; } .sk-health-v3 .sk-health-period { text-align:left; } .sk-health-v3 .sk-health-top { padding:12px; gap:12px; } .sk-health-v3 .sk-pies { grid-template-columns:1fr; } .sk-health-v3 .sk-pie-body { flex-direction:row; align-items:center; } .sk-health-v3 .sk-pie-body svg { width:112px; height:112px; } .sk-health-v3 .sk-comparison { padding:0 12px 12px; } }
+        @media print { .sk-health-v3 { max-width:none; } .sk-health-v3 .sk-table-scroll { overflow:visible; } .sk-health-v3 .sk-bi-table { min-width:0; } .sk-health-v3 .sk-pie-card { break-inside:avoid; } }
+    </style>`;
     ui.HTML.getHealthReport = function (report, config, scope, targetBI, context) {
-        lastConfig = config;
+        const periods = reportPeriods(new Date(), context);
         const metadata = report?.health_bi;
-        const candidate = metadata?.version === VERSION && metadata.signature === signature(config) ? metadata.scopes?.[scope] : null;
-        const snapshot = candidate && (candidate.error || (Array.isArray(candidate.rows) && Array.isArray(candidate.columns))) ? candidate : null;
-        // The old renderer mutates Android; isolate it from the cached source data.
-        const legacy = report?.link8_health || {};
-        const copy = { ...report, link8_health: { ...legacy, [scope]: { ...(legacy[scope] || {}) } } };
-        let summaryConfig = config;
-        if (scope === 'total' && snapshot?.stores?.length) {
-            // The original revenue total can include additional accessible stores.
-            // Limit the overview to the same configured stores as the BI table.
-            const keys = snapshot.stores.map(store => store.key).filter(Boolean);
-            const entries = keys.map(key => report?.link2?.[key]);
-            if (keys.length && entries.every(Boolean)) {
-                const total = {};
-                for (const field of ['t', 'r', 'dtlk', 'dt_dk', 'dtqd_dk', 'lai_gop']) {
-                    if (entries.every(entry => finite(entry[field]))) total[field] = entries.reduce((sum, entry) => sum + entry[field], 0);
-                }
-                for (const [field, weight] of [['tg', 'dtlk'], ['dk', 't']]) {
-                    if (total[weight] > 0 && entries.every(entry => finite(entry[field]) && finite(entry[weight]))) {
-                        total[field] = entries.reduce((sum, entry) => sum + entry[field] * entry[weight], 0) / total[weight];
-                    }
-                }
-                copy.link2 = { ...report.link2, total };
-            } else copy.link2 = { ...report?.link2, total: {} };
-            copy.link7 = Object.fromEntries(keys.map(key => [key, report?.link7?.[key]]));
-            copy.link9 = Object.fromEntries(keys.map(key => [key, report?.link9?.[key]]));
-            summaryConfig = { ...config, totalTarget: keys.reduce((sum, key) => sum + (Number(config['target' + key.replace('shop', '')]) || 0), 0) };
-        }
-        const template = document.createElement('div');
-        template.innerHTML = originalHealth.call(this, copy, summaryConfig, scope, targetBI, context);
-        const container = template.querySelector('.sk-macro-container');
-        const rows = Array.from(template.querySelectorAll('.sk-macro-row'));
-        if (container && rows[0]) {
-            const right = rows[0].querySelector('.sk-col-right');
-            if (right) right.innerHTML = renderCategories(snapshot);
-            const left = rows[0].querySelector('.sk-col-left');
-            if (left) {
-                // These fields are absent in the consolidated-revenue collector; omit placeholders.
-                const installment = scope === 'total' ? shopKeys(config).map(key => copy.link7?.[key] || {}) : [copy.link7?.[scope] || {}];
-                const hasInstallment = installment.some(item => finite(item._SHOP_DT));
-                left.querySelectorAll('tr').forEach(row => {
-                    const label = slug(text(row.cells?.[0]));
-                    if (label === 'loinhuan' && !finite(copy.link2?.[scope]?.lai_gop)) row.remove();
-                    if (label === 'tilepvtc' && !finite(copy.link2?.[scope]?.tlpvtc)) row.remove();
-                    if (!hasInstallment && ['tracham','dtsieuthi','dttracham','homecredit','fecredit'].includes(label)) row.remove();
-                    if (label === 'dukien' && row.cells.length === 2 && row.cells[1].colSpan === 2 && !finite(copy.link2?.[scope]?.dt_dk)) row.remove();
-                });
-                left.insertAdjacentHTML('beforeend', chart(snapshot));
-            }
-            rows.slice(1).forEach(row => row.remove());
-            const title = container.querySelector('.sk-title');
-            if (title && snapshot?.label) title.textContent = 'Sức khỏe ST • ' + snapshot.label;
-            const notice = document.createElement('div');
-            notice.className = 'sk-bi-source';
-            notice.textContent = snapshot?.stores ? snapshot.stores.map(store => store.label).join(' • ') + (snapshot.collectedAt ? ' | Lấy lúc ' + new Date(snapshot.collectedAt).toLocaleString('vi-VN') : '') : 'Dữ liệu ngành hàng BI';
-            container.insertBefore(notice, rows[0]);
-        }
-        requestAnimationFrame(mountSettings);
-        return template.innerHTML + `<style>
-            .sk-macro-container { width:1120px; min-width:1120px; max-width:1120px; }
-            .sk-col-left { width:300px; } .sk-col-right { width:816px; flex:1; min-width:0; }
-            .sk-col-left .sk-inner-table { height:auto; }
-            .sk-bi-table { table-layout:auto; height:auto; }
-            .sk-bi-table th { background:#7030a0; color:white!important; white-space:normal; line-height:1.3; padding:8px 6px; }
-            .sk-bi-table td { padding:5px 7px; height:auto; }
-            .sk-bi-table td:first-child { text-align:left; white-space:normal; min-width:150px; }
-            .sk-bi-parent { background:#eddbf9; font-weight:bold; }
-            .sk-bi-source { padding:7px 10px; font-size:11px; color:#475569; border-bottom:1px solid #cbd5e1; }
-            .sk-bi-empty { padding:22px; color:#92400e; background:#fffbeb; line-height:1.6; font-size:13px; }
-            .sk-bi-chart { padding:18px 12px; font-size:11px; } .sk-bi-chart>b { display:block; margin-bottom:12px; }
-            .sk-bi-bar { display:grid; grid-template-columns:1fr auto; gap:5px; margin:9px 0; }
-            .sk-bi-bar i { display:block; grid-column:1/-1; max-width:100%; height:5px; background:#0ea5e9; border-radius:3px; }
-        </style>`;
-    };
-    function mountSettings() {
-        const active = document.querySelector('.rpt-nav-item.active[data-tab="health"]');
-        let button = document.getElementById('sk-bi-options-button');
-        if (!active) { if (button) button.remove(); return; }
-        if (button) return;
-        const anchor = document.querySelector('.tgdd-view-select');
-        if (!anchor?.parentElement) return;
-        button = document.createElement('button');
-        button.id = 'sk-bi-options-button';
-        button.type = 'button';
-        button.textContent = 'Dữ liệu SKST';
-        button.style.cssText = 'border:1px solid #eab308;border-radius:18px;background:white;color:#334155;padding:6px 10px;cursor:pointer;font-weight:700;font-size:12px';
-        button.onclick = openSettings;
-        anchor.parentElement.appendChild(button);
-    }
-    function openSettings() {
+        const valid = metadata?.version === VERSION && metadata.signature === signature(config) && metadata.periods?.current?.key === periods.current.key;
+        const snapshot = valid ? metadata.scopes?.[scope] : null;
+        const keys = scope === 'total' ? shopKeys(config) : shopKeys(config).filter(key => key === scope);
+        const title = scope === 'total' ? 'Sức khỏe ST · ' + (config.cluster || 'Tổng cụm') : 'Sức khỏe ST · ' + (config[scope + 'Short'] || config[scope] || 'Chưa khai báo');
+        const stores = keys.map(key => (config[key + 'Short'] || config[key]) + (shopCode(config, key) ? ' (' + shopCode(config, key) + ')' : '')).join(' · ');
+        const time = snapshot?.periods?.current?.collectedAt;
+        // Remove the obsolete v2-only selector when upgrading without a page reload.
+        document.getElementById('sk-bi-options-button')?.remove();
         document.getElementById('sk-bi-settings')?.remove();
-        const config = lastConfig;
-        const selected = options(config);
-        const modal = document.createElement('div');
-        modal.id = 'sk-bi-settings';
-        modal.style.cssText = 'position:fixed;inset:0;z-index:1000005;background:#0f172a88;display:flex;align-items:center;justify-content:center;padding:16px;font:14px Arial;color:#1e293b';
-        modal.innerHTML = '<form role="dialog" aria-modal="true" aria-label="Dữ liệu Sức khỏe ST" style="width:440px;max-width:100%;max-height:85vh;overflow:auto;background:white;border-radius:16px;padding:22px">'
-            + '<h3 style="margin-top:0">Dữ liệu Sức khỏe ST</h3><p>Chọn siêu thị trong Tổng cụm. Báo cáo sẽ lấy thêm ngành hàng riêng của từng siêu thị đã chọn.</p>'
-            + shopKeys(config).map(key => '<label style="display:block;margin:12px 0"><input type="checkbox" name="shop" value="' + key + '"' + (selected.shops.includes(key) ? ' checked' : '') + '> ' + escape(config[key + 'Short'] || config[key]) + '</label>').join('')
-            + '<label style="display:block;margin:18px 0">Doanh thu ngành hàng: <select name="mode"><option value="converted">DT quy đổi</option><option value="actual">DT thực</option></select></label>'
-            + '<p style="font-size:12px;color:#64748b">Cột không có dữ liệu và dòng trống tự động được bỏ. Số 0 có thật vẫn hiển thị. Sau khi lưu, chạy lại báo cáo Lũy kế hoặc Toàn bộ.</p>'
-            + '<div role="status" style="color:#b91c1c"></div><div style="display:flex;gap:10px;justify-content:flex-end;margin-top:18px"><button type="button" data-close>Đóng</button><button type="submit">Lưu lựa chọn</button></div></form>';
-        modal.querySelector('select').value = selected.mode;
-        const previous = document.activeElement;
-        const close = () => { modal.remove(); previous?.focus(); };
-        modal.querySelector('[data-close]').onclick = close;
-        modal.onclick = event => { if (event.target === modal) close(); };
-        modal.addEventListener('keydown', event => {
-            if (event.key === 'Escape') close();
-            if (event.key === 'Tab') {
-                const focusable = Array.from(modal.querySelectorAll('input,select,button'));
-                if (event.shiftKey && document.activeElement === focusable[0]) { event.preventDefault(); focusable.at(-1).focus(); }
-                else if (!event.shiftKey && document.activeElement === focusable.at(-1)) { event.preventDefault(); focusable[0].focus(); }
-            }
-        });
-        modal.querySelector('form').onsubmit = event => {
-            event.preventDefault();
-            const shops = Array.from(modal.querySelectorAll('input[name="shop"]:checked')).map(input => input.value);
-            if (!shops.length) { modal.querySelector('[role="status"]').textContent = 'Anh chọn ít nhất một siêu thị nhé.'; return; }
-            GM_setValue(SETTINGS, { shops, mode: modal.querySelector('select').value, signature: signature(config) });
-            close();
-            ui.showToast('Đã lưu. Chạy lại Lũy kế hoặc Toàn bộ để cập nhật Sức khỏe ST.', 6000);
-        };
-        document.body.appendChild(modal);
-        modal.querySelector('input,button')?.focus();
-    }
-    document.addEventListener('click', event => {
-        if (event.target.closest?.('.rpt-nav-item')) requestAnimationFrame(mountSettings);
-    });
-    // Exposed beside the existing DATA/UTILS helpers for deterministic fixture tests.
-    data.healthBI = { number, tableHeaders, parseTable, resolveShop, options, legacyRows, renderCategories };
+        return STYLES + '<div class="sk-wrapper"><div class="sk-macro-container sk-health-v3"><header class="sk-health-header"><div><h2 class="sk-health-title">' + escape(title) + '</h2><p class="sk-source">Theo Khai báo: ' + escape(stores || 'Chưa có siêu thị') + '</p></div>'
+            + '<div class="sk-health-period">' + escape(periods.current.label) + ' so với ' + escape(periods.previous.label) + (time ? '<br>Lấy lúc ' + escape(new Date(time).toLocaleString('vi-VN')) : '') + '</div></header>'
+            + '<div class="sk-health-top">' + renderSummary(valid ? report : {}, config, scope, targetBI) + renderCharts(snapshot, periods) + '</div>'
+            + '<section class="sk-comparison"><h3 class="sk-section-title">Ngành hàng / Nhóm hàng BI · So sánh hai tháng</h3>' + renderCategories(snapshot, periods)
+            + '<p class="sk-health-note">Tháng này theo kỳ Lũy kế đang chọn; tháng trước là trọn tháng liền kề. Doanh thu giữ nguyên đơn vị trên trang nguồn. Δ = tháng này − tháng trước; % = Δ / |tháng trước| × 100. Mốc 0: tháng trước bằng 0. Dòng tô nhạt là ngành hàng; các nhóm hàng được thụt vào bên dưới.</p></section></div></div>';
+    };
+    data.healthBI = { number, tableHeaders, parseTable, resolveShop, options, signature, parseMonth, reportPeriods, mergePeriods, valueFor, delta,
+        legacyRows, renderCategories, renderCharts, renderSummary, pieData, selectMonth, withRetries };
 })(_0x1c5250, _0x432e89, _0x36259b, _0x1221a3);
-// HEALTH_BI_V2_END
+// HEALTH_BI_V3_END
 
 
 _0x565350["init"]();}());
