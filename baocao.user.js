@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.7.5
+// @version      1.7.6
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -709,11 +709,13 @@
     }
 
     async function collectRevenue(cfg, realtime) {
+        assertRevenueMode(realtime);
         await enableOptions();
         let report = data.scrapeRevenueTableDMX(cfg, realtime);
         try {
             if (await switchBasis('actual')) {
                 await enableOptions(false, 'actual');
+                assertRevenueMode(realtime);
                 report = mergeActualReport(report, data.scrapeRevenueTableDMX(cfg, realtime, 'actual'), cfg);
             }
         } finally {
@@ -739,7 +741,7 @@
     function step(method, ...args) {
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => reject(new Error('Hết thời gian tải dữ liệu BI.')), 90000);
-            method(...args, value => { clearTimeout(timer); resolve(value); });
+            method(...args, value => { clearTimeout(timer); value === false ? reject(new Error('BI chưa hoàn tất bước thu thập.')) : resolve(value); });
         });
     }
 
@@ -759,21 +761,22 @@
             const mode = GM_getValue('tgdd_run_sub_mode', 'all');
             if (mode === 'all' || mode === 'realtime') {
                 await step(data.switchAndEnsureTabDMX, 'Realtime');
-                saveReport('link1', await collectRevenue(cfg, true));
+                saveReport('link1', await data.metricAudit.collectRevenue(cfg, true));
                 if (data.realtimeV2BI) {
                     try { await data.realtimeV2BI.collect(cfg); }
-                    catch (error) { ui.showToast('Chưa lấy đủ nhóm hàng Realtime V2: ' + error.message, 6000); }
+                    catch (error) { data.reportPolicy?.failStep(0, error.message); ui.showToast('Chưa lấy đủ nhóm hàng Realtime V2: ' + error.message, 6000); }
                 }
             }
+            if (mode === 'realtime') return;
             await step(data.switchAndEnsureTabDMX, 'Lũy kế');
-            const cumulative = await collectRevenue(cfg, false);
+            const cumulative = await data.metricAudit.collectRevenue(cfg, false);
             saveReport('link2', cumulative);
             if (mode !== 'realtime') {
                 const button = Array.from(document.querySelectorAll('button')).filter(native).find(el => slug(text(el)) === 'nhanvien');
                 if (!button) throw new Error('Không mở được bảng Nhân viên.');
                 button.click();
                 await sleep(350);
-                const staff = await collectStaff(cfg);
+                const staff = await data.metricAudit.collectStaff(cfg);
                 const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {};
                 cache.link6 ||= {};
                 cache.link7 ||= {};
@@ -784,12 +787,14 @@
                 }
                 GM_setValue(constants.KEYS.DATA_CACHE, cache);
             }
-            if (cumulative._actualStatus !== 'ready') ui.showToast('Chưa đọc đủ DT thực của các siêu thị; ô thiếu dữ liệu được ghi Chưa có.', 6000);
+            if (cumulative._actualStatus !== 'ready') { data.reportPolicy?.failStep(0, 'Chưa đọc đủ DT thực của các siêu thị.'); ui.showToast('Chưa đọc đủ DT thực của các siêu thị; ô thiếu dữ liệu được ghi Chưa có.', 6000); }
         };
-        return run().catch(error => {
+        return run().then(() => callback?.(true)).catch(error => {
             console.warn('[AutoBI metrics]', error);
+            data.reportPolicy?.failStep(0, error.message);
             ui.showToast('Chưa lấy đủ chỉ số BI: ' + error.message, 6000);
-        }).finally(() => callback?.());
+            callback?.(false);
+        });
     };
 
     // Use the same BI cutoff on every renderer; a capture on 18/10 can hold
@@ -824,6 +829,7 @@
             const result = await select.call(this, selection);
             selectedKeys = selection.map(shop => shop.key);
             if (/\/dashboard\/tra-cham\/?$/.test(window.location.pathname)) return result;
+            if (GM_getValue('tgdd_run_sub_mode', 'all') === 'realtime') return result;
             const realtime = Array.from(document.querySelectorAll('button')).filter(native).find(el => slug(text(el)) === 'realtime');
             if (realtime && checked(realtime)) return result;
             const cfg = utils.getPersistentConfig(), time = timeContext(cfg);
@@ -846,7 +852,12 @@
             return result;
         };
     }
-    data.metricAudit = { schema: SCHEMA, number, columns, headers, readRow, finish, aggregate, readCards, mergeCards, shops, timeContext, installScopeCapture, formatPercent, formatNumber, conversionEfficiency, formatEfficiency, forecast, mergeActualRow, mergeActualReport, mergeActualStaff, collectRevenue, collectStaff, switchBasis };
+    function assertRevenueMode(realtime) {
+        const name = realtime ? 'realtime' : 'luyke';
+        const button = Array.from(document.querySelectorAll('button, [role="tab"]')).filter(native).find(el => slug(text(el)) === name);
+        if (!button || !checked(button)) throw new Error('Chưa xác minh được chế độ ' + (realtime ? 'Realtime' : 'Lũy kế') + ' của bảng doanh thu.');
+    }
+    data.metricAudit = { schema: SCHEMA, number, columns, headers, readRow, finish, aggregate, readCards, mergeCards, shops, timeContext, installScopeCapture, formatPercent, formatNumber, conversionEfficiency, formatEfficiency, forecast, mergeActualRow, mergeActualReport, mergeActualStaff, collectRevenue, collectStaff, switchBasis, assertRevenueMode };
 })(_0x1c5250, _0x36259b, _0x432e89, _0x1221a3, _0x2aa741);
 // AUTOBI_METRICS_FIX_END
 
@@ -1423,9 +1434,11 @@
         const cfg = runConfig || utils.getPersistentConfig();
         if (!collecting) collecting = collectSnapshot(cfg).then(snapshot => {
             collected = true;
+            if (!snapshot.catalog?.industry?.complete) data.reportPolicy?.failStep(0, snapshot.notes?.[0] || 'Sức khỏe ST chưa lấy đủ dữ liệu.');
             return attachSnapshot(snapshot, cfg);
         }).catch(error => {
             console.warn('[AutoBI Health BI]', error);
+            data.reportPolicy?.failStep(0, error.message);
             ui.showToast('BI chưa hoàn tất: ' + error.message, 5000);
             collected = true;
             return {};
@@ -1437,8 +1450,9 @@
     data.runRevenueSequenceDMX = function (cfg, callback) {
         runConfig = cfg;
         collected = false;
-        const finish = () => { runConfig = null; if (callback) callback(); };
-        return originalRevenue.call(this, cfg, () => {
+        const finish = success => { runConfig = null; if (callback) callback(success !== false); };
+        return originalRevenue.call(this, cfg, success => {
+            if (success === false || GM_getValue('tgdd_run_sub_mode', 'all') === 'realtime') { finish(success); return; }
             if (collected) finish();
             else data.scrapeHealthCategoriesDMX(finish);
         });
@@ -1976,13 +1990,15 @@ _0x1c5250.metricAudit.installScopeCapture();
     function ensureQueue(queue) {
         const options = GM_getValue('tgdd_last_run_options', {}) || {};
         if (!GM_getValue(RUN, null) && (options.installmentOnly || (queue || []).includes(0))) beginRun(options);
+        if (data.reportPolicy) return data.reportPolicy.executionQueue(options);
         if (options.installmentOnly === true) return [1];
         const result = [...new Set(queue || [])];
         if (result.includes(0) && !result.includes(1)) result.splice(result.indexOf(0) + 1, 0, 1);
         return result;
     }
     function seedCache(cfg) {
-        if (GM_getValue('tgdd_last_run_options', {})?.installmentOnly !== true) return {};
+        const options = GM_getValue('tgdd_last_run_options', {}) || {};
+        if (options.allSave === true || options.fullReport === true) return {};
         const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {};
         const time = ui.HTML.resolveTimeContext(cfg), period = `${time.year}-${String(time.month).padStart(2, '0')}`;
         const oldPeriod = cache.link2?._metricTime?.period || cache.installmentBI?.period;
@@ -2161,7 +2177,7 @@ _0x1c5250.metricAudit.installScopeCapture();
     const staffComplete = (staff, cfg, shop) => staffFor(cfg, shop).every(person => known(staff[person.name]?.amount) && known(staff[person.name]?.revenue));
     async function settled(level = 'stores') {
         let previous = '', stable = 0;
-        for (let i = 0; i < 40; i++) {
+        for (let i = 0; i < 100; i++) {
             const views = tableViews(level), current = views.map(view => text(view.table)).join('|');
             const busy = Array.from(document.querySelectorAll('.ant-spin-spinning, [aria-busy="true"], .loading, .spinner')).some(native);
             if (views.length && !busy && current === previous) { if (++stable >= 2) return; }
@@ -2236,6 +2252,9 @@ _0x1c5250.metricAudit.installScopeCapture();
         await settled(level);
         const selected = buttons().find(el => slug(text(el)) === name);
         if (!selected || !isActive(selected)) throw new Error('Chưa xác minh được chế độ ' + name + ' của báo cáo trả chậm.');
+        const cfg = utils.getPersistentConfig();
+        if (value === 'mtd') await driver.ensureMonth(cfg);
+        driver.verifyMonth(cfg, value);
     }
     function callbackStep(method, ...args) {
         return new Promise((resolve, reject) => {
@@ -2262,12 +2281,47 @@ _0x1c5250.metricAudit.installScopeCapture();
     const busy = () => Array.from(document.querySelectorAll('.ant-spin-spinning, [aria-busy="true"], .loading, .spinner')).some(native);
     const pageLevel = () => tableViews('any')[0]?.map.level || '';
     async function waitNative() {
-        return waitFor(() => document.querySelector('.ant-picker input') && (pageLevel() || filterTrigger('Siêu thị')),
-            'Trang Trả chậm chưa tải được bảng hoặc bộ lọc Siêu thị.');
+        return waitFor(() => pageLevel() || filterTrigger('Siêu thị'),
+            'Trang Trả chậm chưa tải được bảng hoặc bộ lọc Siêu thị.', 150);
     }
-    function verifyMonth(cfg) {
-        const time = ui.HTML.resolveTimeContext(cfg), expected = String(time.month).padStart(2, '0') + '/' + time.year;
-        if (String(document.querySelector('.ant-picker input')?.value || '').trim() !== expected) throw new Error('Tháng trả chậm chưa khớp tháng đang chạy.');
+    function monthValue(value) {
+        const s = String(value || '').trim();
+        const a = s.match(/^(\d{4})-(\d{1,2})$/), b = s.match(/^(\d{1,2})\/(\d{4})$/);
+        const year = +(a ? a[1] : b ? b[2] : 0), month = +(a ? a[2] : b ? b[1] : 0);
+        return year >= 2000 && month >= 1 && month <= 12 ? `${year}-${String(month).padStart(2, '0')}` : '';
+    }
+    function monthInput() {
+        return Array.from(document.querySelectorAll('.ant-picker input, input[type="month"], input'))
+            .find(input => native(input) && (input.type === 'month' || monthValue(input.value)));
+    }
+    function expectedMonth(cfg) {
+        const time = ui.HTML.resolveTimeContext(cfg);
+        return `${time.year}-${String(time.month).padStart(2, '0')}`;
+    }
+    function verifyMonth(cfg, value = 'mtd') {
+        const expected = expectedMonth(cfg);
+        if (value === 'realtime') {
+            if (expected !== todayISO().slice(0, 7)) throw new Error('Realtime chỉ lấy số liệu tháng hiện tại.');
+            return;
+        }
+        if (monthValue(monthInput()?.value) !== expected) throw new Error('Tháng trả chậm Lũy kế chưa khớp tháng đang chạy.');
+    }
+    async function ensureMonth(cfg) {
+        const input = await waitFor(monthInput, 'Không tìm thấy ô chọn tháng ở chế độ Lũy kế.');
+        const expected = expectedMonth(cfg);
+        if (monthValue(input.value) === expected) return;
+        if (input.closest('.ant-picker')) await callbackStep(data.selectMonthDMX, expected.slice(5) + '/' + expected.slice(0, 4));
+        else {
+            const value = input.type === 'month' ? expected : expected.slice(5) + '/' + expected.slice(0, 4);
+            const setter = typeof HTMLInputElement !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            if (setter) setter.call(input, value); else input.value = value;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        await waitFor(() => monthValue(monthInput()?.value) === expected, 'Chưa đổi được tháng trả chậm.');
+        const view = buttons().find(el => slug(text(el)) === 'xem');
+        if (view && !view.disabled) view.click();
+        await settled('any');
     }
     function breadcrumb(label) {
         const wanted = slug(label);
@@ -2304,13 +2358,11 @@ _0x1c5250.metricAudit.installScopeCapture();
         await driver.waitNative();
         const tab = buttons().find(el => ['tytrongtragop', 'tytrongtracham'].includes(slug(text(el))));
         if (tab && !isActive(tab)) tab.click();
-        const time = ui.HTML.resolveTimeContext(cfg), expected = String(time.month).padStart(2, '0') + '/' + time.year;
-        if (String(document.querySelector('.ant-picker input')?.value || '').trim() !== expected) await callbackStep(data.selectMonthDMX, expected);
         await clearShopFilter();
+        await driver.mode(collectionModes(cfg)[0], 'any');
         const view = buttons().find(el => slug(text(el)) === 'xem');
         if (view && !view.disabled) view.click();
         await settled('any');
-        verifyMonth(cfg);
         await driver.openRoot();
     }
     async function goPage(number, level) {
@@ -2417,10 +2469,10 @@ _0x1c5250.metricAudit.installScopeCapture();
         result.complete = complete(result.stores, cfg) && summaryComplete(result.summary, cfg);
         result.staffComplete = staffShops.every(shop => result.employees[shop.id]?.complete === true);
         result.conflicts = [...conflicts];
-        verifyMonth(cfg);
+        driver.verifyMonth(cfg, value);
         return result;
     }
-    const driver = { prepare, mode, crawl, waitNative, filterTrigger, pageLevel, openRoot, back, navigationItems, openItem, walkMode, crawlStaff: (cfg, shop) => crawl(cfg, shop) };
+    const driver = { prepare, mode, crawl, waitNative, monthValue, monthInput, ensureMonth, verifyMonth, filterTrigger, pageLevel, openRoot, back, navigationItems, openItem, walkMode, crawlStaff: (cfg, shop) => crawl(cfg, shop) };
     const percentage = row => known(row?.percent) ? row.percent : known(row?.amount) && known(row?.revenue) && row.revenue > 0 ? row.amount / row.revenue * 100 : null;
     function collectionModes(cfg) {
         const time = ui.HTML.resolveTimeContext(cfg);
@@ -2428,7 +2480,8 @@ _0x1c5250.metricAudit.installScopeCapture();
         const live = `${time.year}-${String(time.month).padStart(2, '0')}` === today.slice(0, 7);
         const options = GM_getValue('tgdd_last_run_options', {}) || {};
         if (!live) return ['mtd'];
-        return options.installmentOnly === true || options.realtimeOnly === true ? ['realtime'] : ['realtime', 'mtd'];
+        if (options.realtimeOnly === true) return ['realtime'];
+        return options.luykeOnly === true ? ['mtd'] : ['mtd', 'realtime'];
     }
     function collectionComplete(report) {
         const modes = report?.requiredModes || GM_getValue(RUN, {})?.modes || ['realtime', 'mtd'];
@@ -2483,22 +2536,23 @@ _0x1c5250.metricAudit.installScopeCapture();
         const date = period === today.slice(0, 7) ? today : `${period}-${String(time.daysInMonth).padStart(2, '0')}`;
         const previous = validReport(GM_getValue(constants.KEYS.DATA_CACHE, {}), cfg);
         const report = { version: 2, source: URL, hierarchy: { ...hierarchy, level: 'stores' }, unit: 'million_vnd', signature: signature(cfg), period, date, capturedAt: new Date().toISOString(), requiredModes: modes, notes: [] };
-        // An explicit Realtime refresh retains the existing cumulative snapshot.
-        if (!modes.includes('mtd') && previous?.mtd) report.mtd = { ...previous.mtd, date: previous.mtd.date || previous.date };
+        // Refresh only the requested modes; keep the other snapshot's own date.
+        for (const mode of ['mtd', 'realtime']) if (!modes.includes(mode) && previous?.[mode]) report[mode] = { ...previous[mode], date: previous[mode].date || previous.date };
         GM_setValue(RUN, { ...(GM_getValue(RUN, {}) || {}), modes });
         const save = () => { const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {}; cache.installmentBI = report; applyToCache(cache, cfg, report); GM_setValue(constants.KEYS.DATA_CACHE, cache); };
         save();
         try { await driver.prepare(cfg); }
-        catch (error) { report.notes.push(error.message); save(); throw error; }
+        catch (error) { report.notes.push(error.message); data.reportPolicy?.failStep(1, error.message); save(); throw error; }
         report.staffComplete = true;
         for (const value of modes) {
             try {
                 report[value] = { ...await driver.walkMode(cfg, value), date, capturedAt: new Date().toISOString() };
                 report.notes.push(...(report[value].notes || []).map(note => value + ': ' + note));
-                if (!report[value].complete) report.notes.push(value + ': chưa đọc đủ các siêu thị khai báo trong bảng phân cấp mới.');
+                if (!report[value].complete) { const message = value + ': chưa đọc đủ các siêu thị khai báo trong bảng phân cấp mới.'; report.notes.push(message); data.reportPolicy?.failStep(1, message); }
                 if (report[value].staffComplete === false) { report.staffComplete = false; report.notes.push(value + ': chưa đọc đủ nhân viên theo Khai báo.'); }
             } catch (error) {
                 report.notes.push(value + ': ' + error.message);
+                data.reportPolicy?.failStep(1, value + ': ' + error.message);
                 report[value] = { stores: {}, summary: {}, employees: {}, complete: false, date };
                 if (value === 'mtd') report.staffComplete = false;
             }
@@ -2612,13 +2666,47 @@ _0x1c5250.metricAudit.installScopeCapture();
 // AUTOBI_INSTALLMENT_BI_END
 
 // AUTOBI_RUN_POLICY_START
-(function installReportPolicy(data, utils, ui, app, constants, loader, themeLoader) {
+(function installReportPolicy(data, utils, ui, app, constants, loader, themeLoader, auth, finalize) {
     'use strict';
     const KEY = 'autobi_report_run_v168';
     const getRun = () => GM_getValue(KEY, null);
     const putRun = run => GM_setValue(KEY, run);
     const active = () => { const state = GM_getValue(constants.KEYS.AUTO_STATE, -1); return typeof state === 'number' && state >= 0 && state < 99; };
     let permit = null, lastError = '', historySheet = '', finishingTheme = false;
+    const crmClock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', hourCycle: 'h23' });
+    const crmAllowed = () => { const hour = Number(crmClock.format(new Date())); return hour < 8 || hour >= 18; };
+    function plan(options) {
+        const input = options || {};
+        const allSave = options === undefined || input.allSave === true;
+        const full = allSave || input.fullReport === true;
+        const mode = full ? 'all' : input.installmentOnly ? 'installment' : input.realtimeOnly ? 'realtime' : input.luykeOnly ? 'luyke' : input.crm ? 'crm' : 'all';
+        const crm = crmAllowed() ? [17, 18] : [];
+        const queue = mode === 'all' ? [0, 1, 2, ...crm] : mode === 'installment' ? [1] : mode === 'crm' ? crm : [0, 1, 2];
+        return { mode, queue, allSave, options: { ...input, allSave, fullReport: full && !allSave,
+            installmentOnly: mode === 'installment', realtimeOnly: mode === 'realtime', luykeOnly: mode === 'luyke', crm: mode === 'crm' } };
+    }
+    function executionQueue(options = GM_getValue('tgdd_last_run_options', {})) {
+        const queue = plan(options).queue, run = getRun();
+        GM_setValue(constants.KEYS.RUN_QUEUE, queue);
+        if (run) putRun({ ...run, queue, crmSkipped: (run.mode === 'all' || run.mode === 'crm') && !crmAllowed() });
+        return queue;
+    }
+    function failStep(step, message) {
+        const run = getRun();
+        if (!run) return;
+        const errors = [...(run.errors || [])];
+        const detail = String(message || 'Chưa lấy đủ dữ liệu.');
+        if (!errors.some(error => error.step === step && error.message === detail)) errors.push({ step, message: detail });
+        putRun({ ...run, errors, steps: { ...(run.steps || {}), [step]: 'failed' } });
+    }
+    function completeStep(step) {
+        const run = getRun();
+        if (!run || run.steps?.[step] === 'failed') return;
+        putRun({ ...run, steps: { ...(run.steps || {}), [step]: 'complete' } });
+    }
+    function allStepsComplete(run = getRun()) {
+        return !!(run?.queue?.length && !run.errors?.length && run.queue.every(step => run.steps?.[step] === 'complete'));
+    }
     function sheetId(value) {
         const text = String(value || '').trim();
         const match = text.match(/^https:\/\/docs\.google\.com\/spreadsheets\/d\/([A-Za-z0-9_-]+)(?:[/?#]|$)/i);
@@ -2663,7 +2751,7 @@ _0x1c5250.metricAudit.installScopeCapture();
     function shouldAutoSave(cfg) {
         const run = getRun();
         const id = sheetId(cfg?.historySheetId ?? declaredSheet());
-        return !!(run && run.allSave === true && run.phase === 'running' && !run.saveIssued && id && run.sheetId === id && id === declaredSheet());
+        return !!(run && run.allSave === true && run.phase === 'running' && !run.saveIssued && allStepsComplete(run) && id && run.sheetId === id && id === declaredSheet());
     }
     function authorizeSave(reason, cfg) {
         permit = null;
@@ -2683,7 +2771,7 @@ _0x1c5250.metricAudit.installScopeCapture();
         const previous = cache?.reportMeta || {};
         let cutoff = data.reportOutput.isoDate(previous.revenueCutoff);
         if (Number.isInteger(y) && y >= 2000 && m >= 1 && m <= 12 && Number.isInteger(d) && d >= 0 && d <= new Date(Date.UTC(y, m, 0)).getUTCDate()) cutoff = new Date(Date.UTC(y, m - 1, d)).toISOString().slice(0, 10);
-        result.reportMeta = { ...previous, revenueUnit: previous.revenueUnit || 'million_vnd' };
+        result.reportMeta = { ...previous, revenueUnit: previous.revenueUnit || 'million_vnd', scopeSignature: data.installmentBI.signature(utils.getPersistentConfig()) };
         if (cutoff) result.reportMeta.revenueCutoff = cutoff;
         return result;
     }
@@ -2700,6 +2788,8 @@ _0x1c5250.metricAudit.installScopeCapture();
             return false;
         };
         if (!allowed || allowed.sheetId !== id || id !== declaredSheet()) return fail('Chỉ lưu bằng ALL & LƯU DATA hoặc Lưu Báo Cáo vào ID Sheet đang khai báo.');
+        const run = getRun();
+        if (run?.mode === 'all' && !allStepsComplete(run)) return fail('Báo cáo FULL chưa lấy đủ dữ liệu. Chạy lại các bước lỗi trước khi lưu toàn bộ.');
         if (snapshot && sheetId(snapshot.sheetId) !== id) return fail('Dữ liệu Sức khỏe ST thuộc Sheet khác. Chạy lại báo cáo theo Sheet đang khai báo trước khi lưu.');
         let done = false;
         const finish = saved => {
@@ -2737,20 +2827,97 @@ _0x1c5250.metricAudit.installScopeCapture();
     };
     const rawStartLoading = ui.startThemeLoading;
     ui.startThemeLoading = function (...args) { guardTheme(); if (!quiet()) return rawStartLoading.apply(this, args); };
-    const rawStart = app.startAutoProcess;
     app.startAutoProcess = function (kind, options) {
         permit = null; lastError = '';
-        data.installmentBI.beginRun(options);
-        putRun({ allSave: options === undefined || options?.allSave === true, sheetId: declaredSheet(), phase: 'prepare', saveIssued: false });
-        return rawStart.apply(this, arguments);
+        const run = plan(options), cfg = utils.getPersistentConfig();
+        GM_setValue('tgdd_last_run_options', run.options);
+        GM_setValue('tgdd_run_sub_mode', run.mode);
+        GM_setValue(constants.KEYS.RUN_QUEUE, run.queue);
+        GM_setValue(constants.KEYS.REPORT_TYPE, kind);
+        if (run.mode === 'realtime') GM_deleteValue('tgdd_custom_report_month');
+        if (run.allSave) GM_setValue('tgdd_is_all_save_mode', true); else GM_deleteValue('tgdd_is_all_save_mode');
+        data.installmentBI.beginRun(run.options);
+        putRun({ allSave: run.allSave, mode: run.mode, queue: run.queue, sheetId: declaredSheet(), phase: 'prepare', saveIssued: false, steps: {}, errors: [] });
+        if (!run.queue.length) {
+            GM_setValue(constants.KEYS.AUTO_STATE, -1);
+            stopQuiet();
+            ui.showToast('CRM chỉ chạy trước 08:00 và từ 18:00 theo giờ Việt Nam.', 6000);
+            return;
+        }
+        ui.startThemeLoading();
+        ui.showToast('Chuẩn bị cấu hình…', 0);
+        return auth.check(state => {
+            if (state?.isAuthorized) data.loadConfigAndRun(cfg, GM_getValue('tgdd_custom_report_month', 'current'));
+        });
     };
-    const rawCheck = app.checkAutoProcess;
-    app.checkAutoProcess = function (...args) {
-        if (active()) beginRun();
-        return rawCheck.apply(this, args);
+    const rawCompetition = data.runThiDuaSequenceDMX;
+    data.runThiDuaSequenceDMX = function (groups, cfg, callback) {
+        if (GM_getValue('tgdd_run_sub_mode', 'all') !== 'realtime') return rawCompetition.apply(this, arguments);
+        const invoke = (method, ...args) => new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('Chưa tải xong thi đua Realtime.')), 90000);
+            try { method(...args, success => { clearTimeout(timer); success === false ? reject(new Error('Thi đua Realtime chưa hoàn tất.')) : resolve(); }); }
+            catch (error) { clearTimeout(timer); reject(error); }
+        });
+        const run = async () => {
+            await invoke(data.runFilterAllSequenceDMX);
+            await invoke(data.switchAndEnsureTabDMX, 'Realtime');
+            const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {};
+            cache.link3_smart = data.scrapeThiDuaTablesDMX(groups, cfg, true);
+            GM_setValue(constants.KEYS.DATA_CACHE, cache);
+        };
+        return run().then(() => callback?.(true)).catch(error => { failStep(2, error.message); callback?.(false); });
+    };
+    for (const [name, step] of [['runRevenueSequenceDMX', 0], ['runInstallmentSequenceDMX', 1], ['runThiDuaSequenceDMX', 2], ['runCrmSequence', 17], ['runCrmServiceScoreSequence', 18]]) {
+        const collect = data[name];
+        data[name] = function (...args) {
+            const callback = args[args.length - 1];
+            if (step >= 17 && !crmAllowed()) {
+                executionQueue();
+                if (typeof callback === 'function') callback(true);
+                return;
+            }
+            let done = false;
+            args[args.length - 1] = (...result) => {
+                if (done) return;
+                done = true;
+                if (result[0] === false) failStep(step, 'Bước ' + step + ' chưa hoàn tất.'); else completeStep(step);
+                if (typeof callback === 'function') callback(...result);
+            };
+            try { return collect.apply(this, args); }
+            catch (error) { failStep(step, error.message); args[args.length - 1](false); }
+        };
+    }
+    let checkingStep = null;
+    app.checkAutoProcess = function () {
+        if (!active()) return;
+        const state = GM_getValue(constants.KEYS.AUTO_STATE, -1);
+        if (checkingStep === state) return;
+        checkingStep = state;
+        beginRun();
+        ui.enableWakeLock();
+        const cfg = utils.getPersistentConfig();
+        const next = () => {
+            checkingStep = null;
+            // Check the CRM window again after a long BI collector finishes.
+            const queue = executionQueue(), step = queue.find(value => value > state);
+            if (step !== undefined) {
+                GM_setValue(constants.KEYS.AUTO_STATE, step);
+                window.location.replace(utils.getStepUrl(step, cfg));
+            } else finalize(GM_getValue(constants.KEYS.DATA_CACHE, {}) || {}, cfg);
+        };
+        const queue = executionQueue();
+        if (!queue.includes(state)) { next(); return; }
+        if (state === 0) return data.runRevenueSequenceDMX(cfg, next);
+        if (state === 1) return data.runInstallmentSequenceDMX(cfg, next);
+        if (state === 2) return data.runThiDuaSequenceDMX(GM_getValue(constants.KEYS.CONFIG_LIST, []) || [], cfg, next);
+        if (state === 17) return data.runCrmSequence(cfg, next);
+        if (state === 18) return data.runCrmServiceScoreSequence(cfg, next);
+        next();
     };
     const rawRender = ui.renderReport;
     ui.renderReport = function (...args) {
+        const run = getRun();
+        if (run?.allSave && run.errors?.length) lastError = 'Chưa tự lưu vì báo cáo còn bước lỗi: ' + run.errors[0].message;
         stopQuiet();
         if (GM_getValue('tgdd_last_run_options', {})?.installmentOnly === true) window.force_active_tab = 'health';
         const id = sheetId(args[2]?.historySheetId);
@@ -2772,10 +2939,10 @@ _0x1c5250.metricAudit.installScopeCapture();
     // Only hide this userscript's progress surfaces. Native BI tables remain visible
     // so the collection and scope checks keep working during an unattended run.
     GM_addStyle('.autobi-running-quiet #' + constants.DOM_IDS.TOAST + ',.autobi-running-quiet #tgdd-initial-loader{display:none!important}');
-    data.reportPolicy = { sheetId, beginRun, shouldAutoSave, authorizeSave, quiet, stopQuiet, metadata, lastError: () => lastError };
+    data.reportPolicy = { plan, executionQueue, crmAllowed, failStep, completeStep, allStepsComplete, sheetId, beginRun, shouldAutoSave, authorizeSave, quiet, stopQuiet, metadata, lastError: () => lastError };
     if (getRun()?.phase === 'running' && (active() || GM_getValue(constants.KEYS.IS_PENDING, false))) beginRun();
     else if (!active()) stopQuiet();
-})(_0x1c5250, _0x36259b, _0x432e89, _0x565350, _0x1221a3, _0x3e2ed1, _0x56bb52);
+})(_0x1c5250, _0x36259b, _0x432e89, _0x565350, _0x1221a3, _0x3e2ed1, _0x56bb52, _0x2aa741, _0x3429b9);
 // AUTOBI_RUN_POLICY_END
 
 _0x565350["init"]();}());
