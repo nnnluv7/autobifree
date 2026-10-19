@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.7.6
+// @version      1.7.7
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -2175,6 +2175,34 @@ _0x1c5250.metricAudit.installScopeCapture();
     const complete = (stores, cfg) => m.shops(cfg).length > 0 && m.shops(cfg).every(shop => providers.every(provider => known(stores[shop.id]?.[provider.key]?.amount)));
     const summaryComplete = (summary, cfg) => m.shops(cfg).length > 0 && m.shops(cfg).every(shop => known(summary[shop.id]?.amount) && known(summary[shop.id]?.revenue));
     const staffComplete = (staff, cfg, shop) => staffFor(cfg, shop).every(person => known(staff[person.name]?.amount) && known(staff[person.name]?.revenue));
+    function missingFields(part, cfg) {
+        return m.shops(cfg).flatMap(shop => {
+            const store = part?.stores?.[shop.id], row = part?.summary?.[shop.id];
+            if (!store && !row) return ['Chưa tìm thấy siêu thị ' + shop.short + '.'];
+            const missing = providers.filter(provider => !known(store?.[provider.key]?.amount)).map(provider => provider.name);
+            const issues = missing.length ? [shop.short + ': chưa đọc được DT của ' + missing.join(', ') + '.'] : [];
+            if (!known(row?.amount) || !known(row?.revenue)) issues.push(shop.short + ': thiếu ' + [!known(row?.amount) ? 'DT trả chậm' : '', !known(row?.revenue) ? 'DT siêu thị' : ''].filter(Boolean).join(' và ') + '.');
+            return issues;
+        });
+    }
+    function scrollContainers(level) {
+        const containers = new Set();
+        for (const { table } of tableViews(level)) {
+            // The current BI uses ordinary overflow wrappers as well as Ant tables.
+            // Follow the actual table ancestors instead of assuming an Ant class.
+            for (let el = table; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+                if (native(el) && el.clientWidth > 0 && el.scrollWidth > el.clientWidth + 8) containers.add(el);
+            }
+        }
+        return [...containers];
+    }
+    function scrollTo(container, left) {
+        const before = container.scrollLeft;
+        container.scrollLeft = Math.max(0, Math.min(left, container.scrollWidth - container.clientWidth));
+        if (container.scrollLeft === before) return false;
+        container.dispatchEvent(new Event('scroll', { bubbles: true }));
+        return true;
+    }
     async function settled(level = 'stores') {
         let previous = '', stable = 0;
         for (let i = 0; i < 100; i++) {
@@ -2203,8 +2231,8 @@ _0x1c5250.metricAudit.installScopeCapture();
         const first = Array.from(document.querySelectorAll('.ant-pagination-item-1')).find(native);
         if (first && !first.classList.contains('ant-pagination-item-active')) { first.click(); await settled(level); }
         for (let page = 0; page < 200 && Date.now() < deadline; page++) {
-            const scrolls = [...new Set(tableViews(level).flatMap(view => [view.table.closest('.ant-table-body'), view.table.closest('.ant-table-content')]))].filter(el => el && el.scrollWidth > el.clientWidth + 8);
-            for (const scroll of scrolls) scroll.scrollLeft = 0;
+            const scrolls = scrollContainers(level);
+            for (const scroll of scrolls) scrollTo(scroll, 0);
             for (let turn = 0; turn < 40 && Date.now() < deadline; turn++) {
                 await settled(level);
                 const read = shop ? readStaffPage(cfg, shop) : readPage(cfg);
@@ -2224,7 +2252,7 @@ _0x1c5250.metricAudit.installScopeCapture();
                 let moved = false;
                 for (const scroll of scrolls) {
                     const before = scroll.scrollLeft;
-                    if (before + scroll.clientWidth < scroll.scrollWidth - 4) { scroll.scrollLeft += Math.max(200, scroll.clientWidth * .8); scroll.dispatchEvent(new Event('scroll', { bubbles: true })); moved ||= scroll.scrollLeft > before; }
+                    if (before + scroll.clientWidth < scroll.scrollWidth - 4) moved = scrollTo(scroll, before + Math.max(200, scroll.clientWidth * .8)) || moved;
                 }
                 if (!moved) break;
             }
@@ -2548,7 +2576,12 @@ _0x1c5250.metricAudit.installScopeCapture();
             try {
                 report[value] = { ...await driver.walkMode(cfg, value), date, capturedAt: new Date().toISOString() };
                 report.notes.push(...(report[value].notes || []).map(note => value + ': ' + note));
-                if (!report[value].complete) { const message = value + ': chưa đọc đủ các siêu thị khai báo trong bảng phân cấp mới.'; report.notes.push(message); data.reportPolicy?.failStep(1, message); }
+                if (!report[value].complete) {
+                    const issues = missingFields(report[value], cfg);
+                    const message = value + ': ' + (issues.join(' ') || 'Chưa xác minh đủ dữ liệu trả chậm.');
+                    report.notes.push(message);
+                    data.reportPolicy?.failStep(1, message);
+                }
                 if (report[value].staffComplete === false) { report.staffComplete = false; report.notes.push(value + ': chưa đọc đủ nhân viên theo Khai báo.'); }
             } catch (error) {
                 report.notes.push(value + ': ' + error.message);
@@ -2591,11 +2624,6 @@ _0x1c5250.metricAudit.installScopeCapture();
         return '<table class="bc-table" data-autobi-installment-realtime style="margin-top:5px;width:100%;border-collapse:collapse"><tr class="row-header"><td style="border:1px solid #333;padding:5px">Doanh thu (triệu)</td><td style="border:1px solid #333;padding:5px">Realtime</td></tr>'
             + rows.map(row => `<tr><td style="border:1px solid #333;padding:5px;text-align:left;white-space:normal;line-height:1.15;">${escape(row.label)}</td><td class="bg-pale-green txt-blue" style="border:1px solid #333;padding:5px;text-align:center">${moneyHTML(row.realtime)}</td></tr>`).join('') + '</table>';
     }
-    function realtimeSectionHTML(cache, cfg, scope, historical) {
-        const percent = summary(cache, cfg, scope, 'realtime', historical).percent;
-        const title = scope === 'total' ? cfg.cluster || 'Tổng cụm' : cfg[scope + 'Short'] || cfg[scope] || scope;
-        return `<section style="max-width:540px;margin:12px auto;font-family:Arial,sans-serif"><div style="padding:7px;text-align:center;font-weight:bold;background:#d9ead3">Trả chậm Realtime · ${escape(title)} · ${m.formatPercent(percent)}</div>${realtimeRowsHTML(cache, cfg, scope, historical)}</section>`;
-    }
     function renderCache(cache, cfg, historical) {
         const report = validReport(cache, cfg, historical), copy = { ...(cache || {}) };
         for (const [mode, link] of [['realtime', 'link1'], ['mtd', 'link2']]) {
@@ -2609,22 +2637,20 @@ _0x1c5250.metricAudit.installScopeCapture();
         }
         return copy;
     }
-    // Every store/cluster renderer reads the same native Realtime snapshot,
-    // including reports reconstructed from saved history rather than collected now.
+    // Provider details belong to Realtime V2 (getBCBottom). Other renderers
+    // still share the verified totals without appending a second report table.
     const rendererArgs = {
-        getDashboardReport: [2, 3, 5], getHealthReport: [1, 2, 4],
-        getOneShop: [2, 3, 7], getMultiShop: [2, 5, 7],
-        getRealtimeV4: [2, 3, 5], getRealtimeV3: [2, -1, -1]
+        getDashboardReport: [2, 5], getHealthReport: [1, 4],
+        getOneShop: [2, 7], getMultiShop: [2, 7],
+        getRealtimeV4: [2, 5], getRealtimeV3: [2, -1]
     };
-    for (const [name, [configIndex, scopeIndex, dateIndex]] of Object.entries(rendererArgs)) {
+    for (const [name, [configIndex, dateIndex]] of Object.entries(rendererArgs)) {
         const original = ui.HTML[name];
         if (typeof original !== 'function') continue;
         ui.HTML[name] = function (...args) {
-            const cfg = args[configIndex] || {}, scope = args[scopeIndex] || 'total', historical = args[dateIndex];
-            const cache = args[0];
-            args[0] = renderCache(cache, cfg, historical);
-            const html = original.apply(this, args);
-            return html.includes('data-autobi-installment-realtime') ? html : html + realtimeSectionHTML(cache, cfg, scope, historical);
+            const cfg = args[configIndex] || {}, historical = args[dateIndex];
+            args[0] = renderCache(args[0], cfg, historical);
+            return original.apply(this, args);
         };
     }
     function rowsHTML(cache, cfg, scope, historical) {
@@ -2634,7 +2660,7 @@ _0x1c5250.metricAudit.installScopeCapture();
             return `<tr><td class="sk-text-left" title="${escape(provider.name)}" style="white-space:normal;line-height:1.15;">${escape(provider.name)}</td><td>${label}</td></tr>`;
         }).join('');
     }
-    data.installmentBI = { providers, hierarchy, columns, matches, readPage, readStaffPage, mergeStores, complete, summaryComplete, settled, driver, collect, metric, summary, validReport, realtimeRowsHTML, realtimeSectionHTML, renderCache, collectionModes, collectionComplete, rowsHTML, signature, applyToCache, beginRun, ensureQueue, seedCache, markAttempt, deferMissingStep, completionNotice };
+    data.installmentBI = { providers, hierarchy, columns, matches, readPage, readStaffPage, mergeStores, complete, summaryComplete, missingFields, settled, driver, collect, metric, summary, validReport, realtimeRowsHTML, renderCache, collectionModes, collectionComplete, rowsHTML, signature, applyToCache, beginRun, ensureQueue, seedCache, markAttempt, deferMissingStep, completionNotice };
     const loadConfigAndRun = data.loadConfigAndRun;
     data.loadConfigAndRun = function (cfg, month) {
         if (GM_getValue('tgdd_last_run_options', {})?.installmentOnly !== true) return loadConfigAndRun.apply(this, arguments);
