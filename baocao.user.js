@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.7.1
+// @version      1.7.2
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -1942,6 +1942,8 @@ _0x1c5250.metricAudit.installScopeCapture();
 (function installInstallmentBI(data, utils, ui, constants) {
     'use strict';
     const URL = 'https://baocao.dienmayxanh.com/dashboard/tra-cham';
+    // This page drills down at each filter: area -> stores, store -> employees.
+    const hierarchy = { region: '1428', area: '3843' };
     const m = data.metricAudit;
     const slug = value => utils.toUltraSlug(String(value ?? ''));
     const text = el => String(el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
@@ -1995,9 +1997,12 @@ _0x1c5250.metricAudit.installScopeCapture();
     }
     function completionNotice(cache) {
         const run = GM_getValue(RUN, null);
-        if (!run?.required || !run.attempted || run.noticeShown || cache?.installmentBI?.mtd?.complete) return '';
+        const report = cache?.installmentBI;
+        const missingStaff = report?.staffComplete === false;
+        const missingRealtime = report?.realtime && !report.realtime.complete;
+        if (!run?.required || !run.attempted || run.noticeShown || report?.mtd?.complete && !missingStaff && !missingRealtime) return '';
         GM_setValue(RUN, { ...run, noticeShown: true });
-        const reason = cache?.installmentBI?.notes?.[0];
+        const reason = report?.notes?.[0];
         return 'Trả chậm chưa lấy đủ dữ liệu. ' + (reason || 'Chọn Báo cáo Trả chậm để chạy lại theo Khai báo.');
     }
     const blank = () => Object.fromEntries(providers.map(provider => [provider.key, { amount: null, percent: null }]));
@@ -2012,11 +2017,19 @@ _0x1c5250.metricAudit.installScopeCapture();
         return '';
     }
     function columns(labels) {
-        const map = { label: -1, providers: {} };
+        const map = { label: -1, level: '', providers: {}, summary: {} };
         labels.forEach((label, index) => {
             const s = slug(label), key = providerKey(label);
-            if (/^(sieuthi|tensieuthi|cuahang)$/.test(s)) map.label = index;
-            if (!key) return;
+            if (/^(sieuthi|tensieuthi|cuahang)$/.test(s)) { map.label = index; map.level = 'stores'; }
+            if (/^(nhanvien|tennhanvien|hovaten|manhanvien|msnv)$/.test(s)) { map.label = index; map.level = 'staff'; }
+            if (!key) {
+                let kind = '';
+                if (/tytrongtracham|titrongtracham|tytrongtragop|titrongtragop/.test(s)) kind = 'percent';
+                else if (/^(dt|doanhthu)(tragop|tracham)(trieu|trieudong|trieuvnd)?$/.test(s)) kind = 'amount';
+                else if (/^(dt|doanhthu)(sieuthi|nhanvien|banhang)?(trieu|trieudong|trieuvnd)?$/.test(s)) kind = 'revenue';
+                if (kind) map.summary[kind] = map.summary[kind] === undefined ? index : -1;
+                return;
+            }
             const kind = /[%％]|tytrong|titrong|tyle|tile/.test(label) || /tytrong|titrong|tyle|tile/.test(s) ? 'percent' : 'amount';
             map.providers[key] ||= {};
             // Never guess which duplicate column is the amount column.
@@ -2025,10 +2038,10 @@ _0x1c5250.metricAudit.installScopeCapture();
         });
         return map;
     }
-    function tableViews() {
+    function tableViews(level = 'stores') {
         return [...new Set(Array.from(document.querySelectorAll('.report-table table, .ant-table-content table, .ant-table-container table, table')))]
             .filter(native).map(table => ({ table, map: columns(m.headers(table)) }))
-            .filter(view => view.map.label >= 0 && Object.keys(view.map.providers).length);
+            .filter(view => view.map.label >= 0 && (Object.keys(view.map.providers).length || Object.keys(view.map.summary).length) && (level === 'staff' || view.map.level === 'stores'));
     }
     function matches(label, raw, cfg) {
         const configured = m.shops(cfg);
@@ -2050,8 +2063,15 @@ _0x1c5250.metricAudit.installScopeCapture();
         });
         return found.length === 1 ? found[0] : null;
     }
+    const emptySummary = () => ({ amount: null, revenue: null, percent: null });
+    function mergeValue(target, key, value, conflictKey, conflicts) {
+        if (!known(value)) return;
+        if (conflicts.includes(conflictKey)) { target[key] = null; return; }
+        if (known(target[key]) && Math.abs(target[key] - value) > 1e-8) { conflicts.push(conflictKey); target[key] = null; }
+        else target[key] = value;
+    }
     function readPage(cfg) {
-        const stores = {}, conflicts = [];
+        const stores = {}, summary = {}, conflicts = [];
         for (const { table, map } of tableViews()) {
             for (const row of table.querySelectorAll('tbody tr')) {
                 if (row.closest('table') !== table || /measure-row|summary|total-row/.test(row.className)) continue;
@@ -2059,22 +2079,46 @@ _0x1c5250.metricAudit.installScopeCapture();
                 const shop = matches(text(cells[map.label]), row.getAttribute('data-row-key') || '', cfg);
                 if (!shop) continue;
                 stores[shop.id] ||= blank();
+                summary[shop.id] ||= emptySummary();
+                for (const [kind, index] of Object.entries(map.summary)) if (index >= 0) {
+                    mergeValue(summary[shop.id], kind, m.number(text(cells[index]), kind === 'percent'), shop.id + ':summary:' + kind, conflicts);
+                }
                 for (const [key, indexes] of Object.entries(map.providers)) {
                     for (const kind of ['amount', 'percent']) {
                         const index = indexes[kind];
                         if (!(index >= 0)) continue;
                         const value = m.number(text(cells[index]), kind === 'percent');
                         if (!known(value)) continue;
-                        const old = stores[shop.id][key][kind];
-                        if (known(old) && Math.abs(old - value) > 1e-8) {
-                            conflicts.push(shop.id + ':' + key + ':' + kind);
-                            stores[shop.id][key][kind] = null;
-                        } else stores[shop.id][key][kind] = value;
+                        mergeValue(stores[shop.id][key], kind, value, shop.id + ':' + key + ':' + kind, conflicts);
                     }
                 }
             }
         }
-        return { stores, conflicts };
+        return { stores, summary, conflicts };
+    }
+    const staffId = value => String(value || '').match(/(?:^|\D)(\d{4,})(?:\D|$)/)?.[1] || '';
+    const staffName = value => slug(String(value || '').replace(/^\s*\d+\s*[-–:]?\s*/, ''));
+    const staffFor = (cfg, shop) => (cfg.staffList || []).filter(staff => 'shop' + (staff.shopIdx || 1) === shop.key);
+    function readStaffPage(cfg, shop) {
+        const staff = {}, conflicts = [];
+        for (const { table, map } of tableViews('staff')) for (const row of table.querySelectorAll('tbody tr')) {
+            if (row.closest('table') !== table || /measure-row|summary|total-row/.test(row.className)) continue;
+            const cells = Array.from(row.cells).flatMap(cell => Array(cell.colSpan || 1).fill(cell));
+            const label = text(cells[map.label]), id = staffId(label) || staffId(row.getAttribute('data-row-key'));
+            const configured = staffFor(cfg, shop).filter(person => id ? staffId(person.name) === id : staffName(person.name) === staffName(label));
+            // A row from an area/store table must never be assigned to an employee.
+            if (configured.length !== 1 || matches(label, row.getAttribute('data-row-key') || '', cfg)) continue;
+            const person = configured[0];
+            staff[person.name] ||= { id: staffId(person.name), ...emptySummary(), providers: blank() };
+            for (const [kind, index] of Object.entries(map.summary)) if (index >= 0) {
+                mergeValue(staff[person.name], kind, m.number(text(cells[index]), kind === 'percent'), person.name + ':summary:' + kind, conflicts);
+            }
+            for (const [key, indexes] of Object.entries(map.providers)) for (const kind of ['amount', 'percent']) {
+                if (!(indexes[kind] >= 0)) continue;
+                mergeValue(staff[person.name].providers[key], kind, m.number(text(cells[indexes[kind]]), kind === 'percent'), person.name + ':' + key + ':' + kind, conflicts);
+            }
+        }
+        return { staff, conflicts };
     }
     function mergeStores(target, incoming, conflicts) {
         for (const [id, values] of Object.entries(incoming)) {
@@ -2089,10 +2133,12 @@ _0x1c5250.metricAudit.installScopeCapture();
         }
     }
     const complete = (stores, cfg) => m.shops(cfg).length > 0 && m.shops(cfg).every(shop => providers.every(provider => known(stores[shop.id]?.[provider.key]?.amount)));
-    async function settled() {
+    const summaryComplete = (summary, cfg) => m.shops(cfg).length > 0 && m.shops(cfg).every(shop => known(summary[shop.id]?.amount) && known(summary[shop.id]?.revenue));
+    const staffComplete = (staff, cfg, shop) => staffFor(cfg, shop).every(person => known(staff[person.name]?.amount) && known(staff[person.name]?.revenue));
+    async function settled(level = 'stores') {
         let previous = '', stable = 0;
         for (let i = 0; i < 48; i++) {
-            const views = tableViews(), current = views.map(view => text(view.table)).join('|');
+            const views = tableViews(level), current = views.map(view => text(view.table)).join('|');
             const busy = Array.from(document.querySelectorAll('.ant-spin-spinning, [aria-busy="true"], .loading, .spinner')).some(native);
             if (views.length && !busy && current === previous) { if (++stable >= 2) return; }
             else stable = 0;
@@ -2101,19 +2147,38 @@ _0x1c5250.metricAudit.installScopeCapture();
         }
         throw new Error('Bảng trả chậm chưa tải xong hoặc chưa mở Tỷ trọng trả góp.');
     }
-    async function crawl(cfg) {
-        const stores = {}, conflicts = new Set(), seen = new Set();
+    async function crawl(cfg, shop = null) {
+        const stores = {}, summary = {}, staff = {}, conflicts = new Set(), seen = new Set();
+        const level = shop ? 'staff' : 'stores';
+        function mergeSummary(id, target, incoming) {
+            for (const kind of ['amount', 'revenue', 'percent']) {
+                const key = id + ':summary:' + kind;
+                if (conflicts.has(key)) { target[kind] = null; continue; }
+                if (!known(incoming[kind])) continue;
+                if (known(target[kind]) && Math.abs(target[kind] - incoming[kind]) > 1e-8) { conflicts.add(key); target[kind] = null; }
+                else target[kind] = incoming[kind];
+            }
+        }
         const deadline = Date.now() + 90000;
         const first = Array.from(document.querySelectorAll('.ant-pagination-item-1')).find(native);
-        if (first && !first.classList.contains('ant-pagination-item-active')) { first.click(); await settled(); }
+        if (first && !first.classList.contains('ant-pagination-item-active')) { first.click(); await settled(level); }
         for (let page = 0; page < 200 && Date.now() < deadline; page++) {
-            const scrolls = [...new Set(tableViews().flatMap(view => [view.table.closest('.ant-table-body'), view.table.closest('.ant-table-content')]))].filter(el => el && el.scrollWidth > el.clientWidth + 8);
+            const scrolls = [...new Set(tableViews(level).flatMap(view => [view.table.closest('.ant-table-body'), view.table.closest('.ant-table-content')]))].filter(el => el && el.scrollWidth > el.clientWidth + 8);
             for (const scroll of scrolls) scroll.scrollLeft = 0;
             for (let turn = 0; turn < 40 && Date.now() < deadline; turn++) {
-                await settled();
-                const read = readPage(cfg);
+                await settled(level);
+                const read = shop ? readStaffPage(cfg, shop) : readPage(cfg);
                 read.conflicts.forEach(key => conflicts.add(key));
-                mergeStores(stores, read.stores, conflicts);
+                if (shop) {
+                    for (const [name, values] of Object.entries(read.staff)) {
+                        staff[name] ||= { id: values.id, ...emptySummary(), providers: blank() };
+                        mergeSummary(name, staff[name], values);
+                        mergeStores({ [name]: staff[name].providers }, { [name]: values.providers }, conflicts);
+                    }
+                } else {
+                    mergeStores(stores, read.stores, conflicts);
+                    for (const [id, values] of Object.entries(read.summary)) { summary[id] ||= emptySummary(); mergeSummary(id, summary[id], values); }
+                }
                 let moved = false;
                 for (const scroll of scrolls) {
                     const before = scroll.scrollLeft;
@@ -2121,25 +2186,28 @@ _0x1c5250.metricAudit.installScopeCapture();
                 }
                 if (!moved) break;
             }
-            if (complete(stores, cfg)) break;
-            const state = tableViews().map(view => text(view.table)).join('|');
+            if (shop ? staffComplete(staff, cfg, shop) && staffFor(cfg, shop).every(person => providers.every(provider => known(staff[person.name]?.providers?.[provider.key]?.amount))) : complete(stores, cfg) && summaryComplete(summary, cfg)) break;
+            const state = tableViews(level).map(view => text(view.table)).join('|');
             if (seen.has(state)) break;
             seen.add(state);
             const next = Array.from(document.querySelectorAll('.ant-pagination-next, button[aria-label="Next Page"]')).find(el => native(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !el.classList.contains('ant-pagination-disabled'));
             if (!next) break;
             next.click();
-            await settled();
+            await settled(level);
         }
         for (const key of conflicts) { const [type, code, provider, kind] = key.split(':'); if (stores[type + ':' + code]?.[provider]) stores[type + ':' + code][provider][kind] = null; }
-        return { stores, complete: complete(stores, cfg), conflicts: [...conflicts] };
+        for (const [name, row] of Object.entries(staff)) for (const provider of providers) for (const kind of ['amount', 'percent']) {
+            if (conflicts.has(name + ':' + provider.key + ':' + kind)) row.providers[provider.key][kind] = null;
+        }
+        return shop ? { staff, complete: staffComplete(staff, cfg, shop), conflicts: [...conflicts] } : { stores, summary, complete: complete(stores, cfg) && summaryComplete(summary, cfg), conflicts: [...conflicts] };
     }
     const isActive = button => button.getAttribute('aria-selected') === 'true' || button.getAttribute('aria-pressed') === 'true' || button.getAttribute('data-state') === 'active' || /(?:bg-blue-(?:500|600|700)|bg-\[#[\da-f]+\]|ant-btn-primary)(?:\s|$)/i.test(button.className);
-    async function mode(value) {
+    async function mode(value, level = 'stores') {
         const name = value === 'realtime' ? 'realtime' : 'luyke';
         const button = buttons().find(el => slug(text(el)) === name);
         if (!button) throw new Error('Không tìm thấy nút ' + name + ' của báo cáo trả chậm.');
         if (!isActive(button)) button.click();
-        await settled();
+        await settled(level);
         const selected = buttons().find(el => slug(text(el)) === name);
         if (!selected || !isActive(selected)) throw new Error('Chưa xác minh được chế độ ' + name + ' của báo cáo trả chậm.');
     }
@@ -2150,44 +2218,180 @@ _0x1c5250.metricAudit.installScopeCapture();
             catch (error) { clearTimeout(timer); reject(error); }
         });
     }
+    function filterTrigger(name) {
+        return buttons().find(button => Array.from(button.querySelectorAll('span')).some(span => slug(text(span)) === slug(name)));
+    }
+    const checked = option => typeof option.checked === 'boolean' ? option.checked : option.getAttribute('aria-checked') === 'true' || option.getAttribute('aria-selected') === 'true';
+    const optionLabel = option => text(option.closest('label, [role="option"]') || option.parentElement || option);
+    function filterOptions() {
+        const inputs = Array.from(document.querySelectorAll('input[type="checkbox"], input[type="radio"]')).filter(option => native(option) || native(option.closest('label')));
+        return inputs.length ? inputs : Array.from(document.querySelectorAll('[role="checkbox"], [role="radio"], [role="option"]')).filter(native);
+    }
+    function setSearch(value) {
+        const search = Array.from(document.querySelectorAll('input')).filter(native).find(input => /timkiem|search/.test(slug(input.placeholder || input.getAttribute('placeholder') || '')));
+        if (!search) return false;
+        const setter = typeof HTMLInputElement !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(search, value); else search.value = value;
+        search.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+    }
+    async function selectFilter(name, selections, cfg) {
+        const trigger = filterTrigger(name);
+        if (!trigger) throw new Error('Không tìm thấy bộ lọc ' + name + ' của báo cáo trả chậm.');
+        trigger.click();
+        await sleep(350);
+        setSearch('');
+        await sleep(200);
+        const optionMatches = (option, selection) => {
+            const label = optionLabel(option);
+            return selection.key ? matches(label, option.getAttribute('data-value') || option.getAttribute('value') || '', cfg)?.id === selection.id
+                : new RegExp('(^|\\D)' + selection.code + '(\\D|$)').test(label);
+        };
+        try {
+            const clear = buttons().find(button => /^(bochontatca|huychontatca)$/.test(slug(text(button))));
+            if (clear) clear.click();
+            else for (const option of filterOptions()) if (checked(option)) option.click();
+            await sleep(180);
+            for (const selection of selections) {
+                let options = filterOptions().filter(option => optionMatches(option, selection));
+                if (!options.length && setSearch(selection.code || selection.name)) { await sleep(300); options = filterOptions().filter(option => optionMatches(option, selection)); }
+                if (options.length !== 1) throw new Error('Chưa xác minh được ' + name + ' ' + (selection.code || selection.name) + '.');
+                if (!checked(options[0])) options[0].click();
+                await sleep(180);
+            }
+            if (setSearch('')) await sleep(200);
+            const selected = filterOptions().filter(checked).filter(option => !/^(chontatca|tatca)$/.test(slug(optionLabel(option))));
+            if (selected.length !== selections.length || selections.some(selection => !selected.some(option => optionMatches(option, selection)))) {
+                throw new Error('Bộ lọc ' + name + ' chưa khớp cấp dữ liệu trả chậm.');
+            }
+            const apply = buttons().find(button => ['apdung', 'xacnhan', 'xong'].includes(slug(text(button))));
+            if (apply) apply.click(); else (filterTrigger(name) || trigger).click();
+            await sleep(250);
+        } catch (error) {
+            (filterTrigger(name) || trigger).click();
+            throw error;
+        }
+    }
+    function verifyContext(cfg) {
+        const time = ui.HTML.resolveTimeContext(cfg), expected = String(time.month).padStart(2, '0') + '/' + time.year;
+        if (String(document.querySelector('.ant-picker input')?.value || '').trim() !== expected) throw new Error('Tháng của báo cáo trả chậm chưa khớp tháng đang chạy.');
+        for (const [name, code] of [['Vùng', hierarchy.region], ['Khu vực', hierarchy.area]]) {
+            const trigger = filterTrigger(name);
+            if (!trigger || !new RegExp('(^|\\D)' + code + '(\\D|$)').test(text(trigger))) throw new Error('Báo cáo trả chậm chưa ở ' + name + ' ' + code + '.');
+        }
+    }
+    async function viewScope(cfg, shop = null) {
+        await driver.selectFilter('Siêu thị', shop ? [shop] : [], cfg);
+        verifyContext(cfg);
+        const view = buttons().find(el => slug(text(el)) === 'xem');
+        if (!view || view.disabled) throw new Error('Chưa bấm được Xem của báo cáo trả chậm.');
+        view.click();
+        await settled(shop ? 'staff' : 'stores');
+        verifyContext(cfg);
+    }
     async function prepare(cfg) {
         const tab = buttons().find(el => ['tytrongtragop', 'tytrongtracham'].includes(slug(text(el))));
         if (tab) tab.click();
         const time = ui.HTML.resolveTimeContext(cfg), expected = String(time.month).padStart(2, '0') + '/' + time.year;
         const picker = document.querySelector('.ant-picker input');
         if (!picker || String(picker.value || '').trim() !== expected) await callbackStep(data.selectMonthDMX, expected);
-        await callbackStep(data.runFilterAllSequenceDMX);
-        try { await data.healthBI.driver.selectShops(m.shops(cfg)); }
-        catch (error) { console.warn('[AutoBI trả chậm] Đọc các dòng khớp khai báo:', error.message); }
-        const view = buttons().find(el => slug(text(el)) === 'xem');
-        if (view) view.click();
-        await settled();
-        const actual = document.querySelector('.ant-picker input')?.value;
-        if (String(actual || '').trim() !== expected) throw new Error('Tháng của báo cáo trả chậm chưa khớp tháng đang chạy.');
+        await driver.selectFilter('Vùng', [{ code: hierarchy.region }], cfg);
+        await driver.selectFilter('Khu vực', [{ code: hierarchy.area }], cfg);
+        await viewScope(cfg);
     }
-    const driver = { prepare, mode, crawl };
+    const driver = { prepare, mode, crawl, selectFilter, viewScope, crawlStaff: (cfg, shop) => crawl(cfg, shop) };
+    const percentage = row => known(row?.percent) ? row.percent : known(row?.amount) && known(row?.revenue) && row.revenue > 0 ? row.amount / row.revenue * 100 : null;
+    function applyToCache(cache, cfg, report) {
+        if (report?.version !== 2 || report.signature !== signature(cfg)) return cache;
+        const time = ui.HTML.resolveTimeContext(cfg), period = `${time.year}-${String(time.month).padStart(2, '0')}`;
+        if (report.period !== period) return cache;
+        for (const [mode, link] of [['realtime', 'link1'], ['mtd', 'link2']]) {
+            const part = report[mode];
+            if (!part) continue;
+            if (cache[link]?._metricTime?.period && cache[link]._metricTime.period !== report.period) continue;
+            cache[link] ||= {};
+            const summaries = m.shops(cfg).map(shop => part.summary?.[shop.id]);
+            const sum = field => summaries.length && summaries.every(row => known(row?.[field])) ? summaries.reduce((total, row) => total + row[field], 0) : null;
+            const total = { amount: sum('amount'), revenue: sum('revenue'), percent: null };
+            const write = (key, row) => {
+                cache[link][key] = { ...(cache[link][key] || {}), dt_tragop: known(row?.amount) ? row.amount : null, dt_sieu_thi: known(row?.revenue) ? row.revenue : null, tg: percentage(row), _installmentSource: URL, _installmentPeriod: report.period, _installmentBasis: 'native' };
+            };
+            for (const shop of m.shops(cfg)) write(shop.key, part.summary?.[shop.id]);
+            write('total', total);
+        }
+        for (const shop of m.shops(cfg)) {
+            const part = report.mtd?.employees?.[shop.id];
+            if (!part) continue;
+            cache.link7 ||= {};
+            cache.link7[shop.key] ||= {};
+            for (const person of staffFor(cfg, shop)) {
+                const row = part.staff?.[person.name];
+                cache.link7[shop.key][person.name] = { ...(cache.link7[shop.key][person.name] || {}), tg: percentage(row), dt_tragop: known(row?.amount) ? row.amount : null, dt_sieu_thi: known(row?.revenue) ? row.revenue : null, _installmentSource: URL, _installmentPeriod: report.period, _installmentBasis: 'native' };
+            }
+        }
+        return cache;
+    }
     async function collect(cfg) {
         if (!m.shops(cfg).length) throw new Error('Chưa khai báo siêu thị để lấy trả chậm.');
         const time = ui.HTML.resolveTimeContext(cfg), capturedDate = m.timeContext(cfg).capturedDate;
         const custom = GM_getValue('tgdd_custom_report_month', 'current');
         const date = custom !== 'current' ? `${time.year}-${String(time.month).padStart(2, '0')}-${String(time.daysInMonth).padStart(2, '0')}` : data.reportOutput.isoDate(capturedDate);
-        const report = { version: 1, source: URL, unit: 'million_vnd', signature: signature(cfg), period: `${time.year}-${String(time.month).padStart(2, '0')}`, date, capturedAt: new Date().toISOString(), notes: [] };
-        const save = () => { const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {}; cache.installmentBI = report; GM_setValue(constants.KEYS.DATA_CACHE, cache); };
+        const report = { version: 2, source: URL, hierarchy: { ...hierarchy, level: 'stores' }, unit: 'million_vnd', signature: signature(cfg), period: `${time.year}-${String(time.month).padStart(2, '0')}`, date, capturedAt: new Date().toISOString(), notes: [] };
+        const save = () => { const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {}; cache.installmentBI = report; applyToCache(cache, cfg, report); GM_setValue(constants.KEYS.DATA_CACHE, cache); };
         save();
         try { await driver.prepare(cfg); }
         catch (error) { report.notes.push(error.message); save(); throw error; }
         const runMode = GM_getValue('tgdd_run_sub_mode', 'all');
-        for (const value of runMode === 'all' || runMode === 'realtime' ? ['realtime', 'mtd'] : ['mtd']) {
-            try { await driver.mode(value); report[value] = await driver.crawl(cfg); }
+        const modes = runMode === 'all' || runMode === 'realtime' ? ['realtime', 'mtd'] : ['mtd'];
+        for (const value of modes) {
+            try {
+                await driver.mode(value); report[value] = await driver.crawl(cfg);
+                if (!report[value].complete) report.notes.push(value + ': chưa đọc đủ các siêu thị khai báo ở Khu vực ' + hierarchy.area + '.');
+            }
             catch (error) { report.notes.push(value + ': ' + error.message); report[value] = { stores: {}, complete: false }; }
             save();
         }
+        const staffShops = m.shops(cfg).filter(shop => staffFor(cfg, shop).length);
+        report.staffComplete = true;
+        for (const shop of staffShops) {
+            try {
+                await driver.viewScope(cfg, shop);
+            } catch (error) {
+                report.staffComplete = false;
+                report.notes.push('Nhân viên ' + shop.short + ': ' + error.message);
+                // Never reuse a previous store's employees after a filter failure.
+                for (const value of modes) { report[value].employees ||= {}; report[value].employees[shop.id] = { staff: {}, complete: false }; }
+                save();
+                continue;
+            }
+            for (const value of modes) {
+                report[value].employees ||= {};
+                try {
+                    await driver.mode(value, 'staff');
+                    report[value].employees[shop.id] = await driver.crawlStaff(cfg, shop);
+                    if (!report[value].employees[shop.id].complete) {
+                        report.staffComplete = false;
+                        report.notes.push('Nhân viên ' + shop.short + ' (' + value + '): chưa đọc đủ các nhân viên khai báo.');
+                    }
+                } catch (error) {
+                    report.staffComplete = false;
+                    report.notes.push('Nhân viên ' + shop.short + ' (' + value + '): ' + error.message);
+                    report[value].employees[shop.id] = { staff: {}, complete: false };
+                }
+                save();
+            }
+        }
+        if (staffShops.length) {
+            try { await driver.viewScope(cfg); await driver.mode('mtd'); }
+            catch (error) { report.notes.push('Khôi phục cấp siêu thị: ' + error.message); }
+        }
+        save();
         return report;
     }
     function metric(cache, cfg, scope, provider, historical) {
         const report = cache?.installmentBI;
         const time = ui.HTML.resolveTimeContext(cfg, historical), period = `${time.year}-${String(time.month).padStart(2, '0')}`;
-        if (report?.version !== 1 || report.period !== period || report.signature !== signature(cfg)) return null;
+        if (![1, 2].includes(report?.version) || report.period !== period || report.signature !== signature(cfg)) return null;
         const date = data.reportOutput.isoDate(historical);
         if (date && report.date !== date) return null;
         const requested = m.shops(cfg).filter(shop => scope === 'total' || shop.key === scope);
@@ -2201,7 +2405,7 @@ _0x1c5250.metricAudit.installScopeCapture();
             return `<tr><td class="sk-text-left" title="${escape(provider.name)}" style="white-space:normal;line-height:1.15;">${escape(provider.name)}</td><td>${label}</td></tr>`;
         }).join('');
     }
-    data.installmentBI = { providers, columns, matches, readPage, mergeStores, complete, settled, driver, collect, metric, rowsHTML, signature, beginRun, ensureQueue, seedCache, markAttempt, deferMissingStep, completionNotice };
+    data.installmentBI = { providers, hierarchy, columns, matches, readPage, readStaffPage, mergeStores, complete, summaryComplete, settled, driver, collect, metric, rowsHTML, signature, applyToCache, beginRun, ensureQueue, seedCache, markAttempt, deferMissingStep, completionNotice };
     const loadConfigAndRun = data.loadConfigAndRun;
     data.loadConfigAndRun = function (cfg, month) {
         if (GM_getValue('tgdd_last_run_options', {})?.installmentOnly !== true) return loadConfigAndRun.apply(this, arguments);
@@ -2220,7 +2424,8 @@ _0x1c5250.metricAudit.installScopeCapture();
         markAttempt();
         return collect(cfg).catch(error => console.warn('[AutoBI trả chậm]', error.message)).finally(() => {
             const run = GM_getValue(RUN, {}) || {};
-            GM_setValue(RUN, { ...run, complete: GM_getValue(constants.KEYS.DATA_CACHE, {})?.installmentBI?.mtd?.complete === true });
+            const report = GM_getValue(constants.KEYS.DATA_CACHE, {})?.installmentBI;
+            GM_setValue(RUN, { ...run, complete: report?.mtd?.complete === true && report.staffComplete !== false && (!report.realtime || report.realtime.complete === true) });
             if (GM_getValue(constants.KEYS.AUTO_STATE, -1) === 1) callback?.();
         });
     };
