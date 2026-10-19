@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.6.8
+// @version      1.6.9
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -1893,36 +1893,34 @@ _0x1c5250.metricAudit.installScopeCapture();
     }
     function dailyChart(history, cfg, scope) {
         const model = dailySeries(history, cfg, scope);
-        if (!model.rows.length) return '<div style="padding:40px;text-align:center;color:#007bff;font-weight:bold">Chưa có bản lưu doanh thu trong tháng ' + escape(model.period) + '.</div>';
-        const name = scope === 'total' ? cfg.cluster || 'TỔNG CỤM' : cfg[scope + 'Short'] || cfg[scope] || scope;
+        if (!model.rows.length) return '<div style="text-align:center; padding:50px; font-weight:bold; color:#007bff;">Chưa có dữ liệu lịch sử trong tháng ' + escape(model.period.slice(5) + '/' + model.period.slice(0, 4)) + '!</div>';
+        const name = scope === 'total' ? 'TỔNG CỤM' : cfg[scope + 'Short'] || cfg[scope] || scope;
         const values = model.rows.map(row => row.value).filter(known);
-        const max = Math.max(0, ...values), min = Math.min(0, ...values);
-        const step = (value) => {
-            if (value <= 0) return 10;
-            const pow = Math.pow(10, Math.floor(Math.log10(value)));
-            return Math.ceil(value / pow) * pow;
-        };
-        const high = step(max), low = min < 0 ? -step(-min) : 0;
-        const left = 78, right = 935, top = 45, bottom = 395;
-        const y = value => bottom - (value - low) / (high - low) * (bottom - top), zero = y(0);
-        const fmt = value => new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(value);
-        let svg = `<svg viewBox="0 0 960 445" role="img" aria-label="Doanh thu quy đổi hằng ngày, triệu đồng" style="display:block;width:100%;height:auto;font-family:Arial,sans-serif">`;
-        for (let i = 0; i <= 5; i++) {
-            const value = low + (high - low) * i / 5, yy = y(value);
-            svg += `<line x1="${left}" y1="${yy}" x2="${right}" y2="${yy}" stroke="#e2e8f0"/><text x="${left - 10}" y="${yy + 4}" text-anchor="end" font-size="12" fill="#64748b">${fmt(value)}</text>`;
+        const high = Math.ceil(Math.max(0, ...values) / 10) * 10 || 100;
+        const low = Math.floor(Math.min(0, ...values) / 10) * 10;
+        const range = high - low, zero = -low / range * 100;
+        // Keep the original HTML classes and styling so the existing theme,
+        // bar dimensions, labels, legend and report captures retain their layout.
+        let html = `<div class="tgdd-chart-wrapper">
+                    <div class="chart-title">DOANH THU HÀNG NGÀY THÁNG ${escape(model.period.slice(5))}: <span style="color:#007bff">${escape(name)}</span></div>
+                    <div class="chart-legend">
+                        <div class="legend-item"><div class="legend-color" style="background:#00bfff;"></div> Doanh thu QĐ (Triệu)</div>
+                    </div>
+                    <div class="chart-area">
+                        <div class="chart-y-axis">${[5, 4, 3, 2, 1, 0].map(i => '<span>' + Math.round(low + range * i / 5) + '</span>').join('')}</div>`;
+        if (low < 0) html += `<div style="position:absolute;left:0;right:0;bottom:${zero}%;border-top:1px solid #333;pointer-events:none;"></div>`;
+        for (const row of model.rows) {
+            const valid = known(row.value), height = valid ? Math.abs(row.value) / range * 100 : 0;
+            const label = valid ? utils.formatNumber(row.value) : 'Chưa có';
+            const position = low < 0 ? `position:absolute;left:50%;transform:translateX(-50%);bottom:${valid && row.value < 0 ? (row.value - low) / range * 100 : zero}%;` : '';
+            html += `<div class="chart-column-group">
+                            <div class="chart-bar bar-rate" style="height: ${height}%; width: 40px; border-radius: 4px 4px 0 0; background: #00bfff; box-shadow: 0 0 5px rgba(0, 191, 255, 0.5);${position}">
+                                <div class="bar-value" style="color: #007bff; top: -20px; font-size: 13px;${valid ? '' : 'white-space:nowrap;color:#999;'}">${label}</div>
+                            </div>
+                            <div class="chart-x-label">${row.date.slice(8) + '/' + row.date.slice(5, 7)}</div>
+                        </div>`;
         }
-        svg += `<line x1="${left}" y1="${zero}" x2="${right}" y2="${zero}" stroke="#334155"/>`;
-        const slot = (right - left) / model.rows.length, width = Math.min(45, slot * .6);
-        model.rows.forEach((row, i) => {
-            const x = left + slot * (i + .5), label = row.date.slice(8) + '/' + row.date.slice(5, 7);
-            if (known(row.value)) {
-                const yy = y(row.value), height = Math.abs(yy - zero), labelY = row.value < 0 ? yy + 16 : yy - 9;
-                svg += `<rect x="${x - width / 2}" y="${Math.min(yy, zero)}" width="${width}" height="${height}" rx="3" fill="${row.value < 0 ? '#f59e0b' : '#00bfff'}"/><text x="${x}" y="${labelY}" text-anchor="middle" font-size="12" font-weight="bold" fill="#007bff">${fmt(row.value)}</text>`;
-            } else svg += `<text x="${x}" y="${Math.min(bottom - 8, zero - 8)}" text-anchor="middle" font-size="10" fill="#94a3b8">Chưa có</text>`;
-            svg += `<text x="${x}" y="425" text-anchor="middle" font-size="12" fill="#334155">${label}</text>`;
-        });
-        svg += '</svg>';
-        return `<div class="tgdd-chart-wrapper"><div class="chart-title">DOANH THU HÀNG NGÀY THÁNG ${escape(model.period.slice(5))}: <span style="color:#007bff">${escape(name)}</span></div><div style="text-align:center;padding:12px;font-weight:bold;font-size:13px">Doanh thu QĐ (triệu đồng)</div>${svg}${model.invalid ? '<div style="padding:8px;text-align:center;font-size:11px;color:#64748b">Chưa có: thiếu bản lưu liền ngày hoặc số lưu không hợp lệ.</div>' : ''}</div>`;
+        return html + '</div></div>';
     }
     ui.HTML.getRevenueChart = dailyChart;
     data.reportOutput = { staffPercent, flatRecord, field, isoDate, previousDay, amount, revenue, cutoff, dailySeries, dailyChart };
