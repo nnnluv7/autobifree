@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.7.4
+// @version      1.7.5
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -1967,6 +1967,8 @@ _0x1c5250.metricAudit.installScopeCapture();
     const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const signature = cfg => m.shops(cfg).map(shop => shop.key + '=' + shop.id).sort().join('|');
     const RUN = 'autobi_installment_run_v171';
+    const dayFormat = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const todayISO = () => data.reportOutput.isoDate(dayFormat.format(new Date()));
     function beginRun(options = {}) {
         const required = options.installmentOnly === true || options.allSave === true || options.fullReport === true || options.realtimeOnly === true || options.luykeOnly === true || !Object.keys(options).length;
         GM_setValue(RUN, { required, attempted: false, complete: false, noticeShown: false });
@@ -2006,12 +2008,12 @@ _0x1c5250.metricAudit.installScopeCapture();
     function completionNotice(cache) {
         const run = GM_getValue(RUN, null);
         const report = cache?.installmentBI;
-        const missingStaff = report?.staffComplete === false;
-        const missingRealtime = report?.realtime && !report.realtime.complete;
-        if (!run?.required || !run.attempted || run.noticeShown || report?.mtd?.complete && !missingStaff && !missingRealtime) return '';
+        const modes = report?.requiredModes || run?.modes || ['realtime', 'mtd'];
+        const missingStaff = modes.includes('mtd') && report?.staffComplete === false;
+        if (!run?.required || !run.attempted || run.noticeShown || collectionComplete(report) && !missingStaff) return '';
         GM_setValue(RUN, { ...run, noticeShown: true });
         const reason = report?.notes?.[0];
-        return 'Trả chậm chưa lấy đủ dữ liệu. ' + (reason || 'Chọn Báo cáo Trả chậm để chạy lại theo Khai báo.');
+        return 'Trả chậm' + (modes.includes('realtime') ? ' Realtime' : '') + ' chưa lấy đủ dữ liệu. ' + (reason || 'Chọn Báo cáo Trả chậm để chạy lại theo Khai báo.');
     }
     const blank = () => Object.fromEntries(providers.map(provider => [provider.key, { amount: null, percent: null }]));
     function sourceNumber(value, percent = false) {
@@ -2071,11 +2073,11 @@ _0x1c5250.metricAudit.installScopeCapture();
         });
         if (byCode.length) return byCode.length === 1 ? byCode[0] : null;
         const labelCode = label.match(/^(\d+)\s*[-–:]\s*/)?.[1];
-        if (labelCode && configured.every(shop => shop.code !== labelCode)) return null;
+        const candidates = labelCode ? configured.filter(shop => !shop.code || shop.code === labelCode) : configured;
         const source = slug(label.replace(/^\d+\s*[-–:]\s*/, ''));
-        const exact = configured.filter(shop => source === slug(shop.name.replace(/^\d+\s*[-–:]\s*/, '')));
+        const exact = candidates.filter(shop => source === slug(shop.name.replace(/^\d+\s*[-–:]\s*/, '')));
         if (exact.length) return exact.length === 1 ? exact[0] : null;
-        const found = configured.filter(shop => {
+        const found = candidates.filter(shop => {
             const full = slug(shop.name.replace(/^\d+\s*[-–:]\s*/, ''));
             const name = slug(shop.name.split(/\s+[-–:]\s+/).at(-1));
             const tail = slug(label.split(/\s+[-–:]\s+/).at(-1));
@@ -2360,7 +2362,8 @@ _0x1c5250.metricAudit.installScopeCapture();
         await driver.openRoot();
         const result = { stores: {}, summary: {}, employees: {}, complete: false, conflicts: [], notes: [], paths: [] };
         const conflicts = new Set(), attemptedStaff = new Set();
-        const staffShops = m.shops(cfg).filter(shop => staffFor(cfg, shop).length);
+        // Realtime needs store/provider amounts and the store denominator only.
+        const staffShops = value === 'realtime' ? [] : m.shops(cfg).filter(shop => staffFor(cfg, shop).length);
         const done = () => complete(result.stores, cfg) && summaryComplete(result.summary, cfg) && staffShops.every(shop => attemptedStaff.has(shop.id));
         let visited = 0;
         const deadline = Date.now() + 60000;
@@ -2419,6 +2422,29 @@ _0x1c5250.metricAudit.installScopeCapture();
     }
     const driver = { prepare, mode, crawl, waitNative, filterTrigger, pageLevel, openRoot, back, navigationItems, openItem, walkMode, crawlStaff: (cfg, shop) => crawl(cfg, shop) };
     const percentage = row => known(row?.percent) ? row.percent : known(row?.amount) && known(row?.revenue) && row.revenue > 0 ? row.amount / row.revenue * 100 : null;
+    function collectionModes(cfg) {
+        const time = ui.HTML.resolveTimeContext(cfg);
+        const today = todayISO();
+        const live = `${time.year}-${String(time.month).padStart(2, '0')}` === today.slice(0, 7);
+        const options = GM_getValue('tgdd_last_run_options', {}) || {};
+        if (!live) return ['mtd'];
+        return options.installmentOnly === true || options.realtimeOnly === true ? ['realtime'] : ['realtime', 'mtd'];
+    }
+    function collectionComplete(report) {
+        const modes = report?.requiredModes || GM_getValue(RUN, {})?.modes || ['realtime', 'mtd'];
+        return modes.length > 0 && modes.every(mode => report?.[mode]?.complete === true)
+            && (!modes.includes('mtd') || report?.staffComplete !== false);
+    }
+    function modePart(report, mode, historical) {
+        const part = report?.[mode];
+        if (!part) return null;
+        const date = data.reportOutput.isoDate(historical);
+        const sourceDate = part.date || report.date;
+        if (date && sourceDate !== date) return null;
+        // A previous day's Realtime must not appear as a live value today.
+        if (!date && mode === 'realtime' && sourceDate !== todayISO()) return null;
+        return part;
+    }
     function applyToCache(cache, cfg, report) {
         if (report?.version !== 2 || report.signature !== signature(cfg)) return cache;
         const time = ui.HTML.resolveTimeContext(cfg), period = `${time.year}-${String(time.month).padStart(2, '0')}`;
@@ -2452,26 +2478,29 @@ _0x1c5250.metricAudit.installScopeCapture();
     async function collect(cfg) {
         if (!m.shops(cfg).length) throw new Error('Chưa khai báo siêu thị để lấy trả chậm.');
         const time = ui.HTML.resolveTimeContext(cfg), capturedDate = m.timeContext(cfg).capturedDate;
-        const custom = GM_getValue('tgdd_custom_report_month', 'current');
-        const date = custom !== 'current' ? `${time.year}-${String(time.month).padStart(2, '0')}-${String(time.daysInMonth).padStart(2, '0')}` : data.reportOutput.isoDate(capturedDate);
-        const report = { version: 2, source: URL, hierarchy: { ...hierarchy, level: 'stores' }, unit: 'million_vnd', signature: signature(cfg), period: `${time.year}-${String(time.month).padStart(2, '0')}`, date, capturedAt: new Date().toISOString(), notes: [] };
+        const modes = collectionModes(cfg), today = data.reportOutput.isoDate(capturedDate);
+        const period = `${time.year}-${String(time.month).padStart(2, '0')}`;
+        const date = period === today.slice(0, 7) ? today : `${period}-${String(time.daysInMonth).padStart(2, '0')}`;
+        const previous = validReport(GM_getValue(constants.KEYS.DATA_CACHE, {}), cfg);
+        const report = { version: 2, source: URL, hierarchy: { ...hierarchy, level: 'stores' }, unit: 'million_vnd', signature: signature(cfg), period, date, capturedAt: new Date().toISOString(), requiredModes: modes, notes: [] };
+        // An explicit Realtime refresh retains the existing cumulative snapshot.
+        if (!modes.includes('mtd') && previous?.mtd) report.mtd = { ...previous.mtd, date: previous.mtd.date || previous.date };
+        GM_setValue(RUN, { ...(GM_getValue(RUN, {}) || {}), modes });
         const save = () => { const cache = GM_getValue(constants.KEYS.DATA_CACHE, {}) || {}; cache.installmentBI = report; applyToCache(cache, cfg, report); GM_setValue(constants.KEYS.DATA_CACHE, cache); };
         save();
         try { await driver.prepare(cfg); }
         catch (error) { report.notes.push(error.message); save(); throw error; }
-        const runMode = GM_getValue('tgdd_run_sub_mode', 'all');
-        const modes = ['all', 'realtime', 'installment'].includes(runMode) && custom === 'current' ? ['realtime', 'mtd'] : ['mtd'];
         report.staffComplete = true;
         for (const value of modes) {
             try {
-                report[value] = await driver.walkMode(cfg, value);
+                report[value] = { ...await driver.walkMode(cfg, value), date, capturedAt: new Date().toISOString() };
                 report.notes.push(...(report[value].notes || []).map(note => value + ': ' + note));
                 if (!report[value].complete) report.notes.push(value + ': chưa đọc đủ các siêu thị khai báo trong bảng phân cấp mới.');
                 if (report[value].staffComplete === false) { report.staffComplete = false; report.notes.push(value + ': chưa đọc đủ nhân viên theo Khai báo.'); }
             } catch (error) {
                 report.notes.push(value + ': ' + error.message);
-                report[value] = { stores: {}, summary: {}, employees: {}, complete: false };
-                report.staffComplete = false;
+                report[value] = { stores: {}, summary: {}, employees: {}, complete: false, date };
+                if (value === 'mtd') report.staffComplete = false;
             }
             save();
         }
@@ -2482,31 +2511,67 @@ _0x1c5250.metricAudit.installScopeCapture();
         const report = cache?.installmentBI;
         const time = ui.HTML.resolveTimeContext(cfg, historical), period = `${time.year}-${String(time.month).padStart(2, '0')}`;
         if (![1, 2].includes(report?.version) || report.period !== period || report.signature !== signature(cfg)) return null;
-        const date = data.reportOutput.isoDate(historical);
-        if (date && report.date !== date) return null;
         return report;
     }
     function metric(cache, cfg, scope, provider, historical, mode = 'mtd') {
         const report = validReport(cache, cfg, historical);
         if (!report) return null;
         const requested = m.shops(cfg).filter(shop => scope === 'total' || shop.key === scope);
-        const values = requested.map(shop => report[mode]?.stores?.[shop.id]?.[provider]?.amount);
+        const part = modePart(report, mode, historical);
+        const values = requested.map(shop => part?.stores?.[shop.id]?.[provider]?.amount);
         return values.length && values.every(known) ? values.reduce((sum, value) => sum + value, 0) : null;
     }
     function summary(cache, cfg, scope, mode = 'mtd', historical) {
         const report = validReport(cache, cfg, historical);
         const requested = m.shops(cfg).filter(shop => scope === 'total' || shop.key === scope);
-        const rows = requested.map(shop => report?.[mode]?.summary?.[shop.id]);
+        const part = modePart(report, mode, historical);
+        const rows = requested.map(shop => part?.summary?.[shop.id]);
         const sum = key => rows.length && rows.every(row => known(row?.[key])) ? rows.reduce((total, row) => total + row[key], 0) : null;
         const result = { amount: sum('amount'), revenue: sum('revenue'), percent: null };
         result.percent = scope !== 'total' && rows.length === 1 ? percentage(rows[0]) : percentage(result);
         return result;
     }
     const moneyHTML = value => known(value) ? new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(value) : 'Chưa có';
-    function realtimeRowsHTML(cache, cfg, scope) {
-        const rows = providers.map(provider => ({ label: provider.name, mtd: metric(cache, cfg, scope, provider.key), realtime: metric(cache, cfg, scope, provider.key, null, 'realtime') }));
-        return '<table class="bc-table" style="margin-top:5px"><tr class="row-header"><td>Doanh thu (triệu)</td><td>Lũy kế</td><td>Realtime</td></tr>'
-            + rows.map(row => `<tr><td style="text-align:left;white-space:normal;line-height:1.15;">${escape(row.label)}</td><td>${moneyHTML(row.mtd)}</td><td class="bg-pale-green txt-blue">${moneyHTML(row.realtime)}</td></tr>`).join('') + '</table>';
+    function realtimeRowsHTML(cache, cfg, scope, historical) {
+        const rows = providers.map(provider => ({ label: provider.name, realtime: metric(cache, cfg, scope, provider.key, historical, 'realtime') }));
+        return '<table class="bc-table" data-autobi-installment-realtime style="margin-top:5px;width:100%;border-collapse:collapse"><tr class="row-header"><td style="border:1px solid #333;padding:5px">Doanh thu (triệu)</td><td style="border:1px solid #333;padding:5px">Realtime</td></tr>'
+            + rows.map(row => `<tr><td style="border:1px solid #333;padding:5px;text-align:left;white-space:normal;line-height:1.15;">${escape(row.label)}</td><td class="bg-pale-green txt-blue" style="border:1px solid #333;padding:5px;text-align:center">${moneyHTML(row.realtime)}</td></tr>`).join('') + '</table>';
+    }
+    function realtimeSectionHTML(cache, cfg, scope, historical) {
+        const percent = summary(cache, cfg, scope, 'realtime', historical).percent;
+        const title = scope === 'total' ? cfg.cluster || 'Tổng cụm' : cfg[scope + 'Short'] || cfg[scope] || scope;
+        return `<section style="max-width:540px;margin:12px auto;font-family:Arial,sans-serif"><div style="padding:7px;text-align:center;font-weight:bold;background:#d9ead3">Trả chậm Realtime · ${escape(title)} · ${m.formatPercent(percent)}</div>${realtimeRowsHTML(cache, cfg, scope, historical)}</section>`;
+    }
+    function renderCache(cache, cfg, historical) {
+        const report = validReport(cache, cfg, historical), copy = { ...(cache || {}) };
+        for (const [mode, link] of [['realtime', 'link1'], ['mtd', 'link2']]) {
+            copy[link] = { ...(cache?.[link] || {}) };
+            for (const key of ['total', ...m.shops(cfg).map(shop => shop.key)]) {
+                const row = summary(cache, cfg, key, mode, historical);
+                if (mode === 'mtd' && !modePart(report, mode, historical)) continue;
+                copy[link][key] = { ...(copy[link][key] || {}), tg: row.percent,
+                    dt_tragop: row.amount, dt_sieu_thi: row.revenue };
+            }
+        }
+        return copy;
+    }
+    // Every store/cluster renderer reads the same native Realtime snapshot,
+    // including reports reconstructed from saved history rather than collected now.
+    const rendererArgs = {
+        getDashboardReport: [2, 3, 5], getHealthReport: [1, 2, 4],
+        getOneShop: [2, 3, 7], getMultiShop: [2, 5, 7],
+        getRealtimeV4: [2, 3, 5], getRealtimeV3: [2, -1, -1]
+    };
+    for (const [name, [configIndex, scopeIndex, dateIndex]] of Object.entries(rendererArgs)) {
+        const original = ui.HTML[name];
+        if (typeof original !== 'function') continue;
+        ui.HTML[name] = function (...args) {
+            const cfg = args[configIndex] || {}, scope = args[scopeIndex] || 'total', historical = args[dateIndex];
+            const cache = args[0];
+            args[0] = renderCache(cache, cfg, historical);
+            const html = original.apply(this, args);
+            return html.includes('data-autobi-installment-realtime') ? html : html + realtimeSectionHTML(cache, cfg, scope, historical);
+        };
     }
     function rowsHTML(cache, cfg, scope, historical) {
         return providers.map(provider => {
@@ -2515,7 +2580,7 @@ _0x1c5250.metricAudit.installScopeCapture();
             return `<tr><td class="sk-text-left" title="${escape(provider.name)}" style="white-space:normal;line-height:1.15;">${escape(provider.name)}</td><td>${label}</td></tr>`;
         }).join('');
     }
-    data.installmentBI = { providers, hierarchy, columns, matches, readPage, readStaffPage, mergeStores, complete, summaryComplete, settled, driver, collect, metric, summary, validReport, realtimeRowsHTML, rowsHTML, signature, applyToCache, beginRun, ensureQueue, seedCache, markAttempt, deferMissingStep, completionNotice };
+    data.installmentBI = { providers, hierarchy, columns, matches, readPage, readStaffPage, mergeStores, complete, summaryComplete, settled, driver, collect, metric, summary, validReport, realtimeRowsHTML, realtimeSectionHTML, renderCache, collectionModes, collectionComplete, rowsHTML, signature, applyToCache, beginRun, ensureQueue, seedCache, markAttempt, deferMissingStep, completionNotice };
     const loadConfigAndRun = data.loadConfigAndRun;
     data.loadConfigAndRun = function (cfg, month) {
         if (GM_getValue('tgdd_last_run_options', {})?.installmentOnly !== true) return loadConfigAndRun.apply(this, arguments);
@@ -2538,7 +2603,7 @@ _0x1c5250.metricAudit.installScopeCapture();
             runningInstallment = null;
             const run = GM_getValue(RUN, {}) || {};
             const report = GM_getValue(constants.KEYS.DATA_CACHE, {})?.installmentBI;
-            GM_setValue(RUN, { ...run, complete: report?.mtd?.complete === true && report.staffComplete !== false && (!report.realtime || report.realtime.complete === true) });
+            GM_setValue(RUN, { ...run, complete: collectionComplete(report) });
             if (GM_getValue(constants.KEYS.AUTO_STATE, -1) === 1) callback?.();
         });
         return runningInstallment;
