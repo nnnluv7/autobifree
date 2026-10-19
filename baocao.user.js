@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.7.7
+// @version      1.7.8
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -2949,9 +2949,8 @@ _0x1c5250.metricAudit.installScopeCapture();
         const id = sheetId(args[2]?.historySheetId);
         if (id !== historySheet) { window.tgdd_history_cache = null; historySheet = id; }
         const result = rawRender.apply(this, args);
-        if (lastError) { const message = lastError; lastError = ''; rawToast.call(ui, message, 6000); }
-        const notice = data.installmentBI.completionNotice(args[0]);
-        if (notice) rawToast.call(ui, notice, 7000);
+        // Keep collection diagnostics in the run data without covering the report.
+        ui.hideToast();
         return result;
     };
     const rawDisable = ui.disableWakeLock;
