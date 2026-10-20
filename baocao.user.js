@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.8.1
+// @version      1.8.2
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -1423,24 +1423,30 @@
     function loadHistory(cfg) {
         const sheetId = String(cfg.historySheetId || '').trim();
         if (!sheetId || !constants.GSHEET.HISTORY_API) return Promise.resolve({});
-        if (loadedHistory.has(sheetId)) return Promise.resolve(historyBySheet.get(sheetId) || {});
-        if (loadingHistory.has(sheetId)) return historyPromises.get(sheetId);
-        loadingHistory.add(sheetId);
+        const cacheKey = data.historyBI?.contextKey(cfg) || sheetId;
+        if (loadedHistory.has(cacheKey) && (!data.monthHistory?.connection(cfg) || ['ready', 'error'].includes(data.historyBI.status(cfg)))) return Promise.resolve(historyBySheet.get(sheetId) || {});
+        if (loadingHistory.has(cacheKey)) return historyPromises.get(cacheKey);
+        loadingHistory.add(cacheKey);
         let resolve;
         const promise = new Promise(done => { resolve = done; });
-        historyPromises.set(sheetId, promise);
+        historyPromises.set(cacheKey, promise);
         let done = false;
+        promise.cancel = () => { done = true; resolve({}); };
         const finish = (records, error = '') => {
             if (done) return;
             done = true;
-            loadingHistory.delete(sheetId);
-            loadedHistory.add(sheetId);
+            loadingHistory.delete(cacheKey);
+            loadedHistory.add(cacheKey);
             historyErrors.set(sheetId, error);
-            historyBySheet.set(sheetId, { ...historyMap(records), ...(liveHistoryBySheet.get(sheetId) || {}) });
+            historyBySheet.set(sheetId, { ...(historyBySheet.get(sheetId) || {}), ...historyMap(records), ...(liveHistoryBySheet.get(sheetId) || {}) });
             resolve(historyBySheet.get(sheetId));
             const active = document.querySelector('.rpt-nav-item.active[data-tab="health"]');
             if (active) active.click();
         };
+        if (data.monthHistory?.connection(cfg) && data.historyBI) {
+            data.historyBI.fetch(cfg, records => finish(records, data.historyBI.status(cfg) === 'error' ? 'Chưa tải được lịch sử Google Sheet.' : ''), { date: data.historyBI.contextDate(), detached: true });
+            return promise;
+        }
         GM_xmlhttpRequest({ method: 'GET', url: constants.GSHEET.HISTORY_API + '?sheetId=' + encodeURIComponent(sheetId), timeout: 15000,
             onload: response => { try { const result = JSON.parse(response.responseText); finish(result.status === 'success' ? result.data : {}, result.status === 'success' ? '' : 'Chưa tải được lịch sử Google Sheet.'); } catch (_) { finish({}, 'Lịch sử Google Sheet chưa đọc được.'); } },
             onerror: () => finish({}, 'Chưa kết nối được Google Sheet.'), ontimeout: () => finish({}, 'Google Sheet chưa phản hồi kịp.') });
@@ -1586,7 +1592,16 @@
         return originalSaveHistory.call(this, cache, cfg, finish, date || displayDate(snapshot.date));
     };
 
-    data.healthBI = { version: VERSION, catalogMode: FIXED_MODE, fixedNames: FIXED_NAMES, fixedRows, fixedPart, shopList, isoDate, previousDay, previousMonthDate, pack, unpack, fromRecord, historyMap, metricFor, valuesFor, readPage, collectSnapshot, attachSnapshot, driver, rowsHTML, tableHTML, pieHTML, viewModel, loadHistory };
+    function invalidateHistory(cfg) {
+        const id = String(cfg.historySheetId || '').trim();
+        for (const key of [...loadedHistory]) if (key === id || key.startsWith(id + ':')) loadedHistory.delete(key);
+        for (const key of [...loadingHistory]) if (key === id || key.startsWith(id + ':')) {
+            historyPromises.get(key)?.cancel?.();
+            historyPromises.delete(key);
+            loadingHistory.delete(key);
+        }
+    }
+    data.healthBI = { version: VERSION, catalogMode: FIXED_MODE, fixedNames: FIXED_NAMES, fixedRows, fixedPart, shopList, isoDate, previousDay, previousMonthDate, pack, unpack, fromRecord, historyMap, metricFor, valuesFor, readPage, collectSnapshot, attachSnapshot, driver, rowsHTML, tableHTML, pieHTML, viewModel, loadHistory, invalidateHistory };
 })(_0x1c5250, _0x36259b, _0x432e89, _0x1221a3, hook => {
     const original = _0x3429b9;
     _0x3429b9 = (cache, cfg) => hook(original, cache, cfg);
@@ -3230,6 +3245,168 @@ _0x1c5250.metricAudit.installScopeCapture();
 })(_0x2aa741, _0x1c5250, _0x432e89, _0x565350, _0x36259b, _0x1221a3, state => { _0x4dbbf5 = state; });
 // AUTOBI_LICENSE_END
 
+// AUTOBI_MONTHLY_HISTORY_START
+(function installMonthlyHistory(data, utils, ui, constants) {
+    'use strict';
+    // Release packaging fills this connection privately; no write key is committed.
+    const DEFAULT = { sheetId: '1O22mm0Hl-Am0vVDfjZywnVzeteh-CKemBrbdFbZFbNE', api: "https://script.google.com/macros/s/AKfycbz00Qw4qN3y-pHOiP5IXS0SLlE4fFIsrZr7v5LZT-wj8C9mktRXCyHk-sOMOUiRGeyN/exec", writeKey: "N3AihgosvpsX8_F4ZtZMk3uWHgannCLXVkdBqWqh_fdAmE7wZY5lPJU__FoJjfDU" };
+    const KEY = 'autobi_monthly_history_connections_v1';
+    const monthPattern = /^20\d{2}-(?:0[1-9]|1[0-2])$/;
+    const sheet = cfg => data.reportPolicy.sheetId(cfg?.historySheetId);
+    const esc = value => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+    const label = month => month.slice(5) + '/' + month.slice(0, 4);
+    const endpoint = value => /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(String(value || ''));
+    function connections() {
+        try { const value = GM_getValue(KEY, {}); return typeof value === 'string' ? JSON.parse(value) : value || {}; }
+        catch (_) { return {}; }
+    }
+    function connection(cfg) {
+        const id = sheet(cfg), saved = connections()[id];
+        const value = saved || (id === DEFAULT.sheetId ? DEFAULT : null);
+        return value && endpoint(value.api) ? value : null;
+    }
+    function monthFor(cfg, date) {
+        const historical = /^(\d{2})\/(\d{2})\/(20\d{2})$/.exec(String(date || ''));
+        if (historical) return historical[3] + '-' + historical[2];
+        const selected = /^(\d{1,2})\/(20\d{2})$/.exec(String(GM_getValue('tgdd_custom_report_month', 'current')));
+        if (selected && +selected[1] >= 1 && +selected[1] <= 12) return selected[2] + '-' + selected[1].padStart(2, '0');
+        const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', year: 'numeric', month: '2-digit' }).formatToParts(new Date()).map(part => [part.type, part.value]));
+        return parts.year + '-' + parts.month;
+    }
+    function cacheKey(cfg, date) { const id = sheet(cfg); return connection(cfg) ? id + ':' + monthFor(cfg, date) : id; }
+    function requestURL(cfg, date) {
+        const selected = connection(cfg);
+        return selected ? selected.api + '?sheetId=' + encodeURIComponent(sheet(cfg)) + '&month=' + monthFor(cfg, date) + '&previous=1&boundary=1' : '';
+    }
+    function configure(cfg, api, writeKey) {
+        const id = sheet(cfg);
+        if (!id || !endpoint(api) || typeof writeKey !== 'string' || writeKey.length < 24) return false;
+        const values = connections();
+        values[id] = { api, writeKey };
+        GM_setValue(KEY, values);
+        data.historyBI?.invalidate(cfg);
+        return true;
+    }
+    const transport = GM_xmlhttpRequest;
+    GM_xmlhttpRequest = function (request) {
+        if (request.method !== 'POST' || request.url !== constants.GSHEET.HISTORY_API) return transport(request);
+        let body;
+        try { body = JSON.parse(request.data); } catch (_) { return transport(request); }
+        const cfg = utils.getPersistentConfig(), selected = connection(cfg);
+        if (!selected || !Array.isArray(body.data)) return transport(request);
+        if (!data.license.state().isAuthorized || sheet(cfg) !== data.reportPolicy.sheetId(body.sheetId) || !selected.writeKey) {
+            setTimeout(() => request.onerror?.(), 0);
+            return { abort() {} };
+        }
+        return transport({ ...request, url: selected.api, data: JSON.stringify({ ...body, writeKey: selected.writeKey }) });
+    };
+    let modalSerial = 0, historicalContext = null;
+    function jsonRequest(url, callback) {
+        let done = false, timer;
+        const finish = (payload, error = '') => { if (!done) { done = true; clearTimeout(timer); callback(payload, error); } };
+        timer = setTimeout(() => finish(null, 'Dịch vụ lịch sử chưa phản hồi kịp.'), 90000);
+        return GM_xmlhttpRequest({ method: 'GET', url, timeout: 90000,
+            onload: response => {
+                try {
+                    const value = JSON.parse(response.responseText);
+                    if (response.status !== 200 || value.status !== 'success') throw new Error('Chưa đọc được lịch sử theo tháng.');
+                    finish(value);
+                } catch (_) { finish(null, 'Chưa đọc được lịch sử theo tháng.'); }
+            }, onerror: () => finish(null, 'Chưa kết nối được lịch sử theo tháng.'), ontimeout: () => finish(null, 'Dịch vụ lịch sử chưa phản hồi kịp.') });
+    }
+    function setup(cfg) {
+        const selected = connection(cfg) || {};
+        ui.showMsg('KẾT NỐI LỊCH SỬ THEO THÁNG', '<div style="text-align:left;display:grid;gap:10px"><label>Địa chỉ Apps Script<input id="autobi-monthly-api" type="url" style="width:100%;box-sizing:border-box" value="' + esc(selected.api || '') + '"></label><label>Khóa ghi dữ liệu<input id="autobi-monthly-key" type="password" autocomplete="off" style="width:100%;box-sizing:border-box" value="' + esc(selected.writeKey || '') + '"></label><button type="button" data-autobi-monthly-connect>Lưu kết nối</button><p id="autobi-monthly-setup-error"></p></div>', 'info');
+    }
+    function show(cfg = utils.getPersistentConfig()) {
+        if (!data.license.state().isAuthorized || sheet(cfg) !== sheet(utils.getPersistentConfig())) return;
+        const selected = connection(cfg);
+        if (!selected) { setup(cfg); return; }
+        const serial = ++modalSerial, id = sheet(cfg);
+        ui.showMsg('LỊCH SỬ BÁO CÁO', '<div data-autobi-monthly-panel>Đang tải danh sách tháng…</div>', 'info');
+        jsonRequest(selected.api + '?sheetId=' + encodeURIComponent(id) + '&action=months', (payload, error) => {
+            if (serial !== modalSerial || sheet(utils.getPersistentConfig()) !== id || !data.license.state().isAuthorized) return;
+            if (error || payload.sheetId !== id || !Array.isArray(payload.months) || payload.months.some(month => !monthPattern.test(month))) {
+                ui.showMsg('LỊCH SỬ BÁO CÁO', esc(error || 'Danh sách tháng không hợp lệ.') + '<p><button data-autobi-monthly-retry>Thử lại</button></p>', 'error');
+                return;
+            }
+            const months = [...new Set(payload.months)].sort().reverse();
+            if (!months.length) { ui.showMsg('LỊCH SỬ BÁO CÁO', 'Chưa có tháng đã lưu.', 'info'); return; }
+            const target = monthFor(cfg, historicalContext), selectedMonth = months.includes(target) ? target : months[0];
+            ui.showMsg('LỊCH SỬ BÁO CÁO', '<div style="text-align:left"><label>Tháng / năm <select id="autobi-history-month">' + months.map(month => '<option value="' + month + '"' + (month === selectedMonth ? ' selected' : '') + '>' + label(month) + '</option>').join('') + '</select></label><div id="autobi-history-days" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:16px">Đang tải ngày đã lưu…</div></div>', 'info');
+            loadDays(cfg, selectedMonth, serial);
+        });
+    }
+    function loadDays(cfg, month, serial = ++modalSerial) {
+        const area = document.getElementById('autobi-history-days');
+        if (area) area.textContent = 'Đang tải ngày đã lưu…';
+        const date = '01/' + month.slice(5) + '/' + month.slice(0, 4);
+        data.historyBI.fetch(cfg, records => {
+            if (serial !== modalSerial || !data.license.state().isAuthorized || sheet(cfg) !== sheet(utils.getPersistentConfig())) return;
+            const target = document.getElementById('autobi-history-days');
+            if (!target) return;
+            const days = Object.keys(records).filter(key => key.slice(6) + '-' + key.slice(3, 5) === month).sort((a, b) => +b.slice(0, 2) - +a.slice(0, 2));
+            target.innerHTML = days.length ? days.map(day => '<button type="button" data-autobi-history-date="' + day + '" style="padding:10px 16px;cursor:pointer">' + day + '</button>').join('')
+                : data.historyBI.status(cfg, date) === 'error' ? 'Chưa tải được dữ liệu. <button data-autobi-history-month-retry>Thử lại</button>' : 'Tháng này chưa có ngày đã lưu.';
+        }, { date, detached: true });
+    }
+    function openDate(cfg, date) {
+        if (!data.license.state().isAuthorized || sheet(cfg) !== sheet(utils.getPersistentConfig())) return;
+        const serial = ++modalSerial;
+        data.historyBI.fetch(cfg, records => {
+            if (serial !== modalSerial || sheet(cfg) !== sheet(utils.getPersistentConfig()) || !data.license.state().isAuthorized) return;
+            if (!records[date] || !Object.keys(records[date]).length) { ui.showMsg('LỊCH SỬ BÁO CÁO', 'Ngày này chưa có dữ liệu đã lưu.', 'info'); return; }
+            const report = data.unflattenObject(records[date]);
+            data.fetchConfigForModal(catalog => {
+                if (serial !== modalSerial || !data.license.state().isAuthorized || sheet(cfg) !== sheet(utils.getPersistentConfig())) return;
+                const modal = document.getElementById(constants.DOM_IDS.MSG_MODAL);
+                if (modal) modal.style.display = 'none';
+                document.body.classList.remove('tgdd-body-lock');
+                GM_setValue(constants.KEYS.DATA_CACHE, report);
+                ui.renderReport(report, catalog, cfg, date);
+                ui.hideToast();
+            });
+        }, { date, detached: true });
+    }
+    const showHistory = ui.showHistoryModal;
+    ui.showHistoryModal = function (...args) { return connection(utils.getPersistentConfig()) ? show() : showHistory.apply(this, args); };
+    const render = ui.renderReport;
+    ui.renderReport = function (...args) {
+        historicalContext = args[3] || null;
+        if (connection(args[2]) && historicalContext) {
+            window.tgdd_compare_selected_date = historicalContext;
+            window.tgdd_weekly_compare_date = historicalContext;
+        }
+        return render.apply(this, args);
+    };
+    const context = ui.HTML.resolveTimeContext;
+    ui.HTML.resolveTimeContext = function (cfg, date) {
+        const result = context.call(this, cfg, date || (connection(cfg) ? historicalContext : null));
+        const selected = connection(cfg) && historicalContext && /^(\d{2})\/(\d{2})\/(20\d{2})$/.exec(date || historicalContext);
+        return selected ? { ...result, isPastMonth: false, month: +selected[2], year: +selected[3], daysInMonth: new Date(+selected[3], +selected[2], 0).getDate(), daysPassed: +selected[1], dateStr: date || historicalContext, realtimeStr: 'Dữ liệu ngày ' + (date || historicalContext) } : result;
+    };
+    document.addEventListener('change', event => {
+        if (event.target?.id === 'autobi-history-month' && monthPattern.test(event.target.value)) loadDays(utils.getPersistentConfig(), event.target.value);
+    });
+    document.addEventListener('click', event => {
+        const cfg = utils.getPersistentConfig(), target = event.target?.closest?.('[data-autobi-history-date],[data-autobi-monthly-connect],[data-autobi-monthly-retry],[data-autobi-history-month-retry]');
+        if (!target || !data.license.state().isAuthorized) return;
+        const date = target.getAttribute('data-autobi-history-date');
+        if (date) { openDate(cfg, date); return; }
+        if (target.hasAttribute('data-autobi-monthly-retry')) { show(cfg); return; }
+        if (target.hasAttribute('data-autobi-history-month-retry')) {
+            const month = document.getElementById('autobi-history-month')?.value;
+            if (monthPattern.test(month || '')) { data.historyBI.invalidate(cfg); loadDays(cfg, month); }
+            return;
+        }
+        const api = document.getElementById('autobi-monthly-api')?.value.trim(), key = document.getElementById('autobi-monthly-key')?.value.trim();
+        if (configure(cfg, api, key)) show(cfg);
+        else { const error = document.getElementById('autobi-monthly-setup-error'); if (error) error.textContent = 'Anh kiểm tra địa chỉ /exec và khóa ghi dữ liệu nhé.'; }
+    });
+    data.monthHistory = { connection, configure, monthFor, cacheKey, requestURL, show, openDate, loadDays };
+})(_0x1c5250, _0x36259b, _0x432e89, _0x1221a3);
+// AUTOBI_MONTHLY_HISTORY_END
+
 // AUTOBI_HISTORY_LOADING_START
 (function installHistoryLoading(data, utils, ui, constants) {
     'use strict';
@@ -3238,6 +3415,7 @@ _0x1c5250.metricAudit.installScopeCapture();
     const historyTabs = new Set(['compare_week', 'compare', 'revenue', 'service', 'nlnv']);
     const sheet = cfg => data.reportPolicy.sheetId(cfg?.historySheetId);
     const declared = () => sheet(utils.getPersistentConfig());
+    const contextKey = (cfg, date = historical) => data.monthHistory?.cacheKey(cfg, date) || sheet(cfg);
     const clone = records => JSON.parse(JSON.stringify(records));
     const valid = records => records && typeof records === 'object' && !Array.isArray(records)
         && Object.entries(records).every(([date, row]) => /^(?:\d{1,2}\/\d{1,2}\/\d{4}|\d{4}-\d{2}-\d{2})$/.test(date)
@@ -3246,7 +3424,8 @@ _0x1c5250.metricAudit.installScopeCapture();
     let active = '', generation = 0, view = null, liveReport = null, historical = null;
     function viewCopy(records) {
         const result = clone(records), date = today.format(new Date());
-        if (liveReport && !historical && !Object.prototype.hasOwnProperty.call(result, date)) {
+        const cfg = { historySheetId: active }, currentMonth = date.slice(6) + '-' + date.slice(3, 5);
+        if (liveReport && !historical && (!data.monthHistory?.connection(cfg) || data.monthHistory.monthFor(cfg) === currentMonth) && !Object.prototype.hasOwnProperty.call(result, date)) {
             const flat = {};
             const visit = (value, prefix = '') => {
                 for (const [key, part] of Object.entries(value)) {
@@ -3261,16 +3440,19 @@ _0x1c5250.metricAudit.installScopeCapture();
         }
         return result;
     }
-    function read(id) {
-        const existing = entries.get(id);
+    function revision(id) { try { return Number(sessionStorage.getItem(PREFIX + 'revision:' + id)) || 0; } catch (_) { return epochs.get(id) || 0; } }
+    function read(id, key = contextKey({ historySheetId: id })) {
+        const existing = entries.get(key);
         if (existing && (existing.status !== 'ready' || Date.now() - existing.loadedAt < TTL)) return existing;
-        entries.delete(id);
+        entries.delete(key);
         try {
-            const saved = JSON.parse(sessionStorage.getItem(PREFIX + id) || 'null');
+            const saved = JSON.parse(sessionStorage.getItem(PREFIX + key) || 'null');
             if (saved?.version === 1 && saved.sheetId === id && Number.isFinite(saved.loadedAt)
+                && (saved.key || saved.sheetId) === key
+                && (saved.cacheRevision || 0) === revision(id)
                 && Date.now() - saved.loadedAt >= 0 && Date.now() - saved.loadedAt < TTL && valid(saved.records)) {
                 const entry = { ...saved, status: 'ready', error: '' };
-                entries.set(id, entry);
+                entries.set(key, entry);
                 return entry;
             }
         } catch (_) { /* Memory caching still works when browser storage is unavailable. */ }
@@ -3295,71 +3477,73 @@ _0x1c5250.metricAudit.installScopeCapture();
     function refreshView() {
         if (view && historyTabs.has(view.tab) && current(sheet(view.cfg), view.generation)) view.refresh();
     }
-    function persist(id, entry) {
+    function persist(id, key, entry) {
         try {
-            const body = JSON.stringify({ version: 1, sheetId: id, loadedAt: entry.loadedAt, records: entry.records });
-            if (body.length <= 1000000) sessionStorage.setItem(PREFIX + id, body);
-            else sessionStorage.removeItem(PREFIX + id);
-        } catch (_) { try { sessionStorage.removeItem(PREFIX + id); } catch (_) {} }
+            const body = JSON.stringify({ version: 1, sheetId: id, key, cacheRevision: revision(id), loadedAt: entry.loadedAt, records: entry.records });
+            if (body.length <= 1000000) sessionStorage.setItem(PREFIX + key, body);
+            else sessionStorage.removeItem(PREFIX + key);
+        } catch (_) { try { sessionStorage.removeItem(PREFIX + key); } catch (_) {} }
     }
     function fetch(cfg, callback, options = {}) {
-        const id = sheet(cfg), token = generation;
+        const id = sheet(cfg), token = generation, requestDate = options.date === undefined ? historical : options.date;
+        const key = contextKey(cfg, requestDate), expectedMonth = data.monthHistory?.monthFor(cfg, requestDate);
         if (!id || id !== declared() || !data.license.state().isAuthorized) {
             if (!id || id === declared()) {
-                entries.set(id, { status: 'error', error: 'config' });
+                entries.set(key, { status: 'error', error: 'config' });
                 callback?.({});
             }
             return;
         }
-        if (active !== id) { activate(cfg); return fetch(cfg, callback, options); }
-        const cached = read(id);
-        if (!options.force && cached?.status === 'ready') { callback?.(viewCopy(cached.records)); return; }
-        if (flights.has(id)) {
-            const flight = flights.get(id);
-            if (callback && !flight.waiters.some(waiter => waiter.callback === callback && waiter.generation === token)) flight.waiters.push({ callback, generation: token });
+        if (active !== id && !options.detached) { activate(cfg); return fetch(cfg, callback, options); }
+        const cached = read(id, key), detached = Boolean(options.detached);
+        if (!options.force && cached?.status === 'ready') { callback?.(detached ? clone(cached.records) : viewCopy(cached.records)); return; }
+        if (flights.has(key)) {
+            const flight = flights.get(key);
+            if (callback && !flight.waiters.some(waiter => waiter.callback === callback && waiter.generation === token && waiter.detached === detached)) flight.waiters.push({ callback, generation: token, detached });
             return flight.request;
         }
         const epoch = epochs.get(id) || 0;
-        const entry = { status: 'loading', error: '' }, flight = { waiters: callback ? [{ callback, generation: token }] : [], request: null, cancel: null };
-        entries.set(id, entry);
-        flights.set(id, flight);
+        const entry = { status: 'loading', error: '', sheetId: id }, flight = { waiters: callback ? [{ callback, generation: token, detached }] : [], request: null, cancel: null, sheetId: id };
+        entries.set(key, entry);
+        flights.set(key, flight);
         let finished = false, timer;
         function finish(records, error = '') {
             if (finished) return;
             finished = true;
             clearTimeout(timer);
-            if (flights.get(id) === flight) flights.delete(id);
+            if (flights.get(key) === flight) flights.delete(key);
             if ((epochs.get(id) || 0) !== epoch) return;
             if (error) { entry.status = 'error'; entry.error = error; }
             else {
                 entry.status = 'ready'; entry.records = records; entry.loadedAt = Date.now();
-                persist(id, entry);
+                persist(id, key, entry);
             }
             // Each callback sees a view copy; synthetic unsaved 'today' rows in
             // the legacy renderer must never enter the server-history cache.
             const result = error ? {} : viewCopy(records);
-            for (const waiter of flight.waiters) if (current(id, waiter.generation)) {
-                try { waiter.callback(result); } catch (cause) { console.warn('[AutoBI history view]', cause.message); }
+            for (const waiter of flight.waiters) if (waiter.detached ? id === declared() && data.license.state().isAuthorized : current(id, waiter.generation)) {
+                try { waiter.callback(waiter.detached && !error ? clone(records) : result); } catch (cause) { console.warn('[AutoBI history view]', cause.message); }
             }
-            if (id === active && id === declared()) refreshView();
+            if (id === active && id === declared() && key === contextKey(cfg)) refreshView();
         }
         flight.cancel = () => {
             if (finished) return;
             finished = true;
             clearTimeout(timer);
-            flights.delete(id);
+            flights.delete(key);
             flight.request?.abort();
         };
         timer = setTimeout(() => { finish(null, 'timeout'); flight.request?.abort(); }, TIMEOUT);
-        if (!constants.GSHEET.HISTORY_API) { finish(null, 'config'); return; }
+        const monthlyURL = data.monthHistory?.requestURL(cfg, requestDate);
+        if (!monthlyURL && !constants.GSHEET.HISTORY_API) { finish(null, 'config'); return; }
         try {
-            flight.request = GM_xmlhttpRequest({ method: 'GET', url: constants.GSHEET.HISTORY_API + '?sheetId=' + encodeURIComponent(id), timeout: TIMEOUT,
+            flight.request = GM_xmlhttpRequest({ method: 'GET', url: monthlyURL || constants.GSHEET.HISTORY_API + '?sheetId=' + encodeURIComponent(id), timeout: TIMEOUT,
                 onload: response => {
                     if (finished) return;
                     if (response.status !== 200) { finish(null, 'http'); return; }
                     try {
                         const payload = JSON.parse(response.responseText);
-                        if (payload.status !== 'success' || !valid(payload.data)) { finish(null, 'response'); return; }
+                        if (payload.status !== 'success' || !valid(payload.data) || (monthlyURL && (payload.sheetId !== id || payload.month !== expectedMonth))) { finish(null, 'response'); return; }
                         finish(payload.data);
                     } catch (_) { finish(null, 'response'); }
                 }, onerror: () => finish(null, 'network'), ontimeout: () => finish(null, 'timeout'), onabort: () => finish(null, 'aborted') });
@@ -3368,7 +3552,7 @@ _0x1c5250.metricAudit.installScopeCapture();
     }
     function retry(cfg) {
         const id = sheet(cfg);
-        if (!id || id !== declared() || flights.has(id)) return;
+        if (!id || id !== declared() || flights.has(contextKey(cfg))) return;
         window.tgdd_history_cache = null;
         fetch(cfg, records => { window.tgdd_history_cache = records; }, { force: true });
         refreshView();
@@ -3390,16 +3574,21 @@ _0x1c5250.metricAudit.installScopeCapture();
             return true;
         }
         area.innerHTML = '<div data-autobi-history-loading style="text-align:center;padding:50px;min-height:180px;font-weight:bold;color:#007bff">Đang tải dữ liệu lịch sử…</div>';
-        if (!flights.has(id)) fetch(cfg, records => { window.tgdd_history_cache = records; });
+        if (!flights.has(contextKey(cfg))) fetch(cfg, records => { window.tgdd_history_cache = records; });
         return true;
     }
     function invalidate(cfg) {
         const id = sheet(cfg);
         if (!id) return;
         epochs.set(id, (epochs.get(id) || 0) + 1);
-        flights.get(id)?.cancel();
-        entries.delete(id);
+        try { sessionStorage.setItem(PREFIX + 'revision:' + id, String(revision(id) + 1)); } catch (_) {}
+        for (const flight of [...flights.values()]) if (flight.sheetId === id) flight.cancel();
+        for (const [key, entry] of entries) if (key === id || entry.sheetId === id) {
+            entries.delete(key);
+            try { sessionStorage.removeItem(PREFIX + key); } catch (_) {}
+        }
         try { sessionStorage.removeItem(PREFIX + id); } catch (_) {}
+        data.healthBI?.invalidateHistory?.(cfg);
         if (active === id) {
             window.tgdd_history_cache = null;
             const previous = view;
@@ -3424,7 +3613,7 @@ _0x1c5250.metricAudit.installScopeCapture();
     document.addEventListener('click', event => {
         if (event.target?.closest?.('[data-autobi-history-retry]') && view) retry(view.cfg);
     });
-    data.historyBI = { fetch, activate, watch, ensureView, retry, invalidate, ttl: TTL, timeout: TIMEOUT, status: cfg => read(sheet(cfg))?.status || 'idle' };
+    data.historyBI = { fetch, activate, watch, ensureView, retry, invalidate, contextKey, contextDate: () => historical, ttl: TTL, timeout: TIMEOUT, status: (cfg, date = historical) => read(sheet(cfg), contextKey(cfg, date))?.status || 'idle' };
 })(_0x1c5250, _0x36259b, _0x432e89, _0x1221a3);
 // AUTOBI_HISTORY_LOADING_END
 
