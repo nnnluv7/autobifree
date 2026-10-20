@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.8.3
+// @version      1.8.4
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -470,7 +470,7 @@
         const month = document.querySelector('.ant-picker input')?.value?.match(/^(\d{1,2})\/(\d{4})$/);
         if (month) { base.month = +month[1]; base.year = +month[2]; }
         const now = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', day: '2-digit', month: '2-digit', year: 'numeric' }).format(new Date());
-        return { ...base, period: `${base.year}-${String(base.month).padStart(2, '0')}`, capturedDate: now };
+        return { ...base, period: `${base.year}-${String(base.month).padStart(2, '0')}`, capturedDate: now, capturedAt: new Date().toISOString() };
     }
 
     function cardLabel(value, basis = 'converted') {
@@ -1847,16 +1847,21 @@ _0x1c5250.metricAudit.installScopeCapture();
         if (Math.abs(n) > 1e9 || known(target) && target > 0 && Math.abs(n) > target * 1000) return null;
         return n;
     }
-    function revenue(record, cfg, scope) {
+    function readRevenue(record, cfg, scope, link = 'link2') {
         const unit = field(record, 'reportMeta|||revenueUnit') || 'million_vnd';
-        const read = key => amount(field(record, 'link2|||' + key + '|||r'), data.metricAudit.number(field(record, 'link2|||' + key + '|||t')), unit);
+        const mode = field(record, link + '|||_metricMode');
+        const signature = field(record, 'reportMeta|||scopeSignature');
+        const basis = field(record, link + '|||_metricBasis');
+        if (signature && signature !== data.installmentBI.signature(cfg) || basis && basis !== 'converted') return { value: null, source: 'missing' };
+        if (mode && mode !== (link === 'link1' ? 'realtime' : 'mtd')) return { value: null, source: 'missing' };
+        const read = key => amount(field(record, link + '|||' + key + '|||r'), data.metricAudit.number(field(record, link + '|||' + key + '|||t')), unit);
         const value = read(scope);
         if (known(value)) return { value, source: 'saved' };
         if (scope === 'total') {
             const shops = data.healthBI.shopList(cfg), values = shops.map(shop => read(shop.key));
             if (values.length && values.every(known)) return { value: values.reduce((sum, value) => sum + value, 0), source: 'stores' };
         }
-        const snapshot = data.healthBI.fromRecord(flatRecord(record));
+        const snapshot = link === 'link2' && data.healthBI.fromRecord(flatRecord(record));
         const sheetId = value => data.reportPolicy ? data.reportPolicy.sheetId(value) : String(value || '').trim();
         if (snapshot && sheetId(snapshot.sheetId) === sheetId(cfg.historySheetId)) {
             const total = data.healthBI.metricFor(snapshot, scope, 'industry', '__total__', data.healthBI.shopList(cfg));
@@ -1864,6 +1869,25 @@ _0x1c5250.metricAudit.installScopeCapture();
             if (known(n)) return { value: n, source: 'healthBI' };
         }
         return { value: null, source: 'missing' };
+    }
+    const revenue = (record, cfg, scope) => readRevenue(record, cfg, scope);
+    const vietnamDate = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', day: '2-digit', month: '2-digit', year: 'numeric' });
+    function captureDate(record, link) {
+        const raw = field(record, link + '|||_metricTime|||capturedDate');
+        const date = isoDate(raw);
+        const at = field(record, link + '|||_metricTime|||capturedAt');
+        const instant = typeof at === 'string' && /^\d{4}-\d\d-\d\dT/.test(at) && new Date(at);
+        const timed = instant && Number.isFinite(instant.getTime()) ? isoDate(vietnamDate.format(instant)) : '';
+        if (date && timed && date !== timed) return '';
+        return date || timed;
+    }
+    function capturedAt(record, link, fallback) {
+        const at = field(record, link + '|||_metricTime|||capturedAt');
+        if (typeof at === 'string' && Number.isFinite(Date.parse(at))) return Date.parse(at);
+        const text = String(field(record, link + '|||_metricTime|||realtimeStr') || '');
+        const clock = /^(\d\d):(\d\d)\s*-\s*(\d{1,2}\/\d{1,2}\/\d{4})$/.exec(text);
+        if (clock && +clock[1] < 24 && +clock[2] < 60 && isoDate(clock[3])) return Date.parse(isoDate(clock[3]) + 'T' + clock[1] + ':' + clock[2] + ':00+07:00');
+        return Date.parse((captureDate(record, link) || fallback) + 'T00:00:00+07:00');
     }
     function cutoff(record, savedDate) {
         const explicit = isoDate(field(record, 'reportMeta|||revenueCutoff'));
@@ -1877,27 +1901,40 @@ _0x1c5250.metricAudit.installScopeCapture();
         return previousDay(savedDate);
     }
     function dailySeries(history, cfg, scope) {
-        const time = ui.HTML.resolveTimeContext(cfg), period = `${time.year}-${String(time.month).padStart(2, '0')}`;
-        const points = new Map();
+        const time = ui.HTML.resolveTimeContext(cfg), historical = data.historyBI?.contextDate?.();
+        const period = data.monthHistory?.monthFor(cfg, historical) || `${time.year}-${String(time.month).padStart(2, '0')}`;
+        const limit = isoDate(historical) || isoDate(vietnamDate.format(new Date()));
+        const points = new Map(), realtime = new Map();
         const records = Object.entries(history || {}).sort((a, b) => isoDate(a[0]).localeCompare(isoDate(b[0])));
+        const live = data.historyBI?.liveRecord?.(cfg);
+        if (live) records.push([live.date, live.record]);
+        const select = (map, date, value, stamp) => {
+            const old = map.get(date);
+            if (!old || known(value.value) && (!known(old.value) || stamp >= old.stamp)) map.set(date, { date, ...value, stamp });
+        };
         for (const [label, record] of records) {
             const savedDate = isoDate(label);
-            if (!savedDate) continue;
+            if (!savedDate || savedDate > limit) continue;
             const date = cutoff(record, savedDate);
-            if (!date.startsWith(period)) continue;
-            const value = revenue(record, cfg, scope);
-            const old = points.get(date);
-            if (!old || known(value.value) || !known(old.value)) points.set(date, { date, ...value });
+            if (date.startsWith(period) && date <= limit) select(points, date, revenue(record, cfg, scope), capturedAt(record, 'link2', savedDate));
+            const rtDate = captureDate(record, 'link1');
+            const rtPeriod = field(record, 'link1|||_metricTime|||period');
+            if (field(record, 'link1|||_metricMode') === 'realtime' && rtDate && rtDate.startsWith(period) && rtDate <= limit && (!rtPeriod || rtPeriod === period)) {
+                const value = readRevenue(record, cfg, scope, 'link1');
+                if (known(value.value)) select(realtime, rtDate, { ...value, source: 'realtime' }, capturedAt(record, 'link1', savedDate));
+            }
         }
-        const dates = [...points.keys()].sort();
+        const dates = [...new Set([...points.keys(), ...realtime.keys()])].sort();
         if (!dates.length) return { period, rows: [], invalid: 0 };
         const last = +dates[dates.length - 1].slice(-2), first = Math.max(+dates[0].slice(-2), last - 13);
         const rows = [];
         for (let day = first; day <= last; day++) {
             const date = period + '-' + String(day).padStart(2, '0'), current = points.get(date);
             const before = day === 1 ? { value: 0 } : points.get(previousDay(date));
-            const value = known(current?.value) && known(before?.value) ? current.value - before.value : null;
-            rows.push({ date, value, source: current?.source || 'missing' });
+            const closed = known(current?.value) && known(before?.value);
+            const rt = realtime.get(date);
+            const value = closed ? current.value - before.value : known(rt?.value) ? rt.value : null;
+            rows.push({ date, value, source: closed ? current.source : known(rt?.value) ? 'realtime' : 'missing', capturedAt: !closed && rt ? rt.stamp : null });
         }
         return { period, rows, invalid: rows.filter(row => !known(row.value)).length };
     }
@@ -1927,13 +1964,13 @@ _0x1c5250.metricAudit.installScopeCapture();
                             <div class="chart-bar bar-rate" style="height: ${height}%; width: 40px; border-radius: 4px 4px 0 0; background: #00bfff; box-shadow: 0 0 5px rgba(0, 191, 255, 0.5);${position}">
                                 <div class="bar-value" style="color: #007bff; top: -20px; font-size: 13px;${valid ? '' : 'white-space:nowrap;color:#999;'}">${label}</div>
                             </div>
-                            <div class="chart-x-label">${row.date.slice(8) + '/' + row.date.slice(5, 7)}</div>
+                            <div class="chart-x-label">${row.date.slice(8) + '/' + row.date.slice(5, 7)}${row.source === 'realtime' ? '<div style="font-size:10px;font-weight:normal;color:#64748b" title="Doanh thu Realtime tại thời điểm lấy dữ liệu">Realtime ' + escape(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(row.capturedAt))) + '</div>' : ''}</div>
                         </div>`;
         }
         return html + '</div></div>';
     }
     ui.HTML.getRevenueChart = dailyChart;
-    data.reportOutput = { staffPercent, flatRecord, field, isoDate, previousDay, amount, revenue, cutoff, dailySeries, dailyChart };
+    data.reportOutput = { staffPercent, flatRecord, field, isoDate, previousDay, amount, revenue, captureDate, cutoff, dailySeries, dailyChart };
 })(_0x1c5250, _0x36259b, _0x432e89);
 // AUTOBI_REPORT_OUTPUT_END
 
@@ -2803,10 +2840,11 @@ _0x1c5250.metricAudit.installScopeCapture();
             if (saved) { window.tgdd_history_cache = null; historySheet = id; }
             if (callback) callback(saved);
         };
-        const timer = setTimeout(() => finish(false), 20000);
+        const timer = setTimeout(() => finish(false), 90000);
         let prepared = metadata(cache || {});
         if (snapshot && snapshot.sheetId !== id) prepared = { ...prepared, healthBI: data.healthBI.pack({ ...snapshot, sheetId: id }) };
-        try { return rawSave.call(this, prepared, { ...cfg, historySheetId: id }, finish, date); }
+        const saveDate = date || new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', day: '2-digit', month: '2-digit', year: 'numeric' }).format(new Date());
+        try { return rawSave.call(this, prepared, { ...cfg, historySheetId: id }, finish, saveDate); }
         catch (error) { finish(false); console.warn('[Báo cáo] Không lưu được:', error.message); return false; }
     };
     const rawFetch = data.fetchHistoryFromSheet;
@@ -3432,7 +3470,7 @@ _0x1c5250.metricAudit.installScopeCapture();
             setTimeout(() => request.onerror?.(), 0);
             return { abort() {} };
         }
-        return transport({ ...request, url: selected.api, data: JSON.stringify({ ...body, writeKey: selected.writeKey }) });
+        return transport({ ...request, url: selected.api, timeout: 90000, ontimeout: () => request.onerror?.(), onabort: () => request.onerror?.(), data: JSON.stringify({ ...body, writeKey: selected.writeKey }) });
     };
     let modalSerial = 0, historicalContext = null;
     function jsonRequest(url, callback) {
@@ -3556,22 +3594,28 @@ _0x1c5250.metricAudit.installScopeCapture();
             && row && typeof row === 'object');
     const today = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', day: '2-digit', month: '2-digit', year: 'numeric' });
     let active = '', generation = 0, view = null, liveReport = null, historical = null;
+    function liveRecord(cfg) {
+        if (!liveReport || historical || sheet(cfg) !== active || active !== declared() || !data.license.state().isAuthorized) return null;
+        const current = today.format(new Date()), month = current.slice(6) + '-' + current.slice(3, 5);
+        if (data.monthHistory?.monthFor(cfg) !== month) return null;
+        const dates = ['link1', 'link2'].map(link => data.reportOutput.captureDate(liveReport, link)).filter(Boolean).sort();
+        const iso = dates.at(-1), date = iso ? iso.slice(8) + '/' + iso.slice(5, 7) + '/' + iso.slice(0, 4) : current;
+        if (iso && (iso > data.reportOutput.isoDate(current) || iso.slice(0, 7) !== month)) return null;
+        const record = {};
+        const visit = (value, prefix = '') => {
+            for (const [key, part] of Object.entries(value)) {
+                if (part === undefined) continue;
+                const path = prefix ? prefix + '|||' + key : key;
+                if (part && typeof part === 'object' && !Array.isArray(part)) visit(part, path);
+                else record[path] = part;
+            }
+        };
+        visit(liveReport);
+        return { date, record };
+    }
     function viewCopy(records) {
-        const result = clone(records), date = today.format(new Date());
-        const cfg = { historySheetId: active }, currentMonth = date.slice(6) + '-' + date.slice(3, 5);
-        if (liveReport && !historical && (!data.monthHistory?.connection(cfg) || data.monthHistory.monthFor(cfg) === currentMonth) && !Object.prototype.hasOwnProperty.call(result, date)) {
-            const flat = {};
-            const visit = (value, prefix = '') => {
-                for (const [key, part] of Object.entries(value)) {
-                    if (part === undefined) continue;
-                    const path = prefix ? prefix + '|||' + key : key;
-                    if (part && typeof part === 'object' && !Array.isArray(part)) visit(part, path);
-                    else flat[path] = part;
-                }
-            };
-            visit(liveReport);
-            result[date] = flat;
-        }
+        const result = clone(records), live = liveRecord({ historySheetId: active });
+        if (live && !Object.prototype.hasOwnProperty.call(result, live.date)) result[live.date] = live.record;
         return result;
     }
     function revision(id) { try { return Number(sessionStorage.getItem(PREFIX + 'revision:' + id)) || 0; } catch (_) { return epochs.get(id) || 0; } }
@@ -3747,7 +3791,7 @@ _0x1c5250.metricAudit.installScopeCapture();
     document.addEventListener('click', event => {
         if (event.target?.closest?.('[data-autobi-history-retry]') && view) retry(view.cfg);
     });
-    data.historyBI = { fetch, activate, watch, ensureView, retry, invalidate, contextKey, contextDate: () => historical, ttl: TTL, timeout: TIMEOUT, status: (cfg, date = historical) => read(sheet(cfg), contextKey(cfg, date))?.status || 'idle' };
+    data.historyBI = { fetch, activate, watch, ensureView, retry, invalidate, liveRecord, contextKey, contextDate: () => historical, ttl: TTL, timeout: TIMEOUT, status: (cfg, date = historical) => read(sheet(cfg), contextKey(cfg, date))?.status || 'idle' };
 })(_0x1c5250, _0x36259b, _0x432e89, _0x1221a3);
 // AUTOBI_HISTORY_LOADING_END
 
