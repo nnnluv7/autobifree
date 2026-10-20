@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.8.2
+// @version      1.8.3
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -2946,6 +2946,140 @@ _0x1c5250.metricAudit.installScopeCapture();
     else if (!active()) stopQuiet();
 })(_0x1c5250, _0x36259b, _0x432e89, _0x565350, _0x1221a3, _0x3e2ed1, _0x56bb52, _0x2aa741, _0x3429b9);
 // AUTOBI_RUN_POLICY_END
+
+// AUTOBI_CLOUD_CONFIGURATION_START
+(function installCloudConfiguration(data, utils, ui, constants) {
+    'use strict';
+    // Capture the original CRM -> BI directory before license setup replaces AUTH.
+    const directory = { ...constants.GSHEET.AUTH };
+    const CACHE = 'autobi_cloud_identity_v1', TTL = 5 * 60000, TIMEOUT = 90000;
+    const pending = new Map();
+    let lastLoad = null;
+    const account = () => {
+        const user = data.license?.state().userName || '';
+        return { user, id: data.license?.userId(user) || '' };
+    };
+    function rows(text) {
+        if (!String(text).trim() || /<(?:!doctype|html|head|body)\b/i.test(text)) throw new Error('directory');
+        const result = []; let row = [], cell = '', quoted = false;
+        for (let i = 0; i < text.length; i++) {
+            const char = text[i];
+            if (char === '"') {
+                if (quoted && text[i + 1] === '"') { cell += '"'; i++; }
+                else quoted = !quoted;
+            } else if (char === ',' && !quoted) { row.push(cell.trim()); cell = ''; }
+            else if ((char === '\n' || char === '\r') && !quoted) {
+                if (char === '\r' && text[i + 1] === '\n') i++;
+                row.push(cell.trim()); if (row.some(Boolean)) result.push(row); row = []; cell = '';
+            } else cell += char;
+        }
+        if (quoted) throw new Error('directory');
+        row.push(cell.trim()); if (row.some(Boolean)) result.push(row);
+        return result;
+    }
+    function canonical(text, id) {
+        const names = new Set();
+        for (const row of rows(text)) {
+            if (row.length < 2 || !row.slice(0, 2).some(value => data.license.userId(value) === id)) continue;
+            const name = row[1].trim();
+            if (!name || /^(?:true|false|0|1)$/i.test(name)) continue;
+            const other = data.license.userId(name);
+            if (other && other !== id) continue;
+            names.add(name);
+        }
+        return names.size === 1 ? [...names][0] : null;
+    }
+    function cached(id) {
+        try {
+            const value = GM_getValue(CACHE, {}), entry = value[id];
+            return entry && entry.directory === directory.ID && entry.gid === String(directory.GID)
+                && entry.id === id && typeof entry.name === 'string' && entry.name
+                && !/^(?:true|false|0|1)$/i.test(entry.name)
+                && Date.now() >= entry.at && Date.now() - entry.at < TTL ? entry.name : null;
+        } catch (_) { return null; }
+    }
+    function resolve(callback) {
+        const current = account();
+        if (!current.id) { callback?.(null); return; }
+        const hit = cached(current.id);
+        if (hit) { callback?.(hit); return; }
+        if (pending.has(current.id)) { pending.get(current.id).push(callback); return; }
+        pending.set(current.id, [callback]);
+        let done = false, timer;
+        const finish = name => {
+            if (done) return; done = true; clearTimeout(timer);
+            const waiters = pending.get(current.id) || []; pending.delete(current.id);
+            if (account().id !== current.id) return;
+            if (name) {
+                const saved = GM_getValue(CACHE, {}) || {};
+                saved[current.id] = { id: current.id, name, directory: directory.ID, gid: String(directory.GID), at: Date.now() };
+                GM_setValue(CACHE, saved);
+            }
+            for (const waiter of waiters) waiter?.(name);
+        };
+        timer = setTimeout(() => finish(null), TIMEOUT);
+        return GM_xmlhttpRequest({ method: 'GET',
+            url: 'https://docs.google.com/spreadsheets/d/' + directory.ID + '/export?format=csv&gid=' + directory.GID + '&range=A%3AB',
+            timeout: TIMEOUT,
+            onload: response => {
+                try { finish(response.status === 200 ? canonical(response.responseText, current.id) : null); }
+                catch (_) { finish(null); }
+            }, onerror: () => finish(null), ontimeout: () => finish(null), onabort: () => finish(null) });
+    }
+    data.getStandardUserName = resolve;
+    data.loadMonthlyGroupConfig = function (month, callback) {
+        const current = account(), number = Number(month);
+        const selected = String(GM_getValue('tgdd_custom_report_month', ''));
+        lastLoad = { month: number, period: selected || String(number), status: 'loading' };
+        const load = lastLoad;
+        if (!Number.isInteger(number) || number < 1 || number > 12) { load.status = 'invalid'; callback?.(null); return; }
+        return resolve(user => {
+            if (account().id !== current.id || lastLoad !== load) return;
+            if (!user) { load.status = 'identity'; callback?.(null); return; }
+            let done = false, timer;
+            const finish = (value, status) => {
+                if (done) return; done = true; clearTimeout(timer);
+                if (account().id !== current.id || lastLoad !== load) return;
+                if (!data.license.state().isAuthorized) {
+                    load.status = 'denied';
+                    GM_setValue(constants.KEYS.AUTO_STATE, -1);
+                    GM_deleteValue(constants.KEYS.RUN_QUEUE);
+                    data.reportPolicy.stopQuiet();
+                    ui.hideToast();
+                    return;
+                }
+                load.status = status; callback?.(value);
+            };
+            timer = setTimeout(() => finish(null, 'timeout'), TIMEOUT);
+            GM_xmlhttpRequest({ method: 'GET', timeout: TIMEOUT,
+                url: constants.GSHEET.CONFIG_API + '?user=' + encodeURIComponent(user) + '&type=monthly_groups&month=' + number + '&_t=' + Date.now(),
+                onload: response => {
+                    try {
+                        if (response.status !== 200) { finish(null, 'network'); return; }
+                        const payload = JSON.parse(response.responseText);
+                        if (payload.status !== 'success' || !payload.data) { finish(null, 'missing'); return; }
+                        let value = payload.data;
+                        for (let i = 0; i < 5 && typeof value === 'string'; i++) value = JSON.parse(value);
+                        const groups = Array.isArray(value) ? value : value?.groups;
+                        finish(groups?.length ? value : null, groups?.length ? 'ready' : 'missing');
+                    } catch (_) { finish(null, 'response'); }
+                }, onerror: () => finish(null, 'network'), ontimeout: () => finish(null, 'timeout'), onabort: () => finish(null, 'network') });
+        });
+    };
+    const show = ui.showMsg;
+    ui.showMsg = function (title, html, ...args) {
+        if (lastLoad && /(?:Không tìm thấy dữ liệu|chưa lưu cấu hình)/i.test(String(html)) && /Cloud/.test(String(html))) {
+            const period = /^\d{1,2}\/20\d{2}$/.test(lastLoad.period) ? lastLoad.period : String(lastLoad.month);
+            title = 'CHƯA NẠP ĐƯỢC CẤU HÌNH MỤC TIÊU';
+            html = lastLoad.status === 'missing' ? 'Chưa tìm thấy cấu hình mục tiêu đã lưu cho tháng ' + period + '.'
+                : lastLoad.status === 'identity' ? 'Chưa xác minh được tên tài khoản lưu cấu hình. Anh thử lại để nạp đúng mục tiêu tháng ' + period + '.'
+                : 'Chưa tải được cấu hình mục tiêu tháng ' + period + '. Anh thử lại; chương trình sẽ chạy khi nạp được đúng cấu hình.';
+        }
+        return show.call(this, title, html, ...args);
+    };
+    data.cloudConfig = { directory, resolve, canonical, ttl: TTL, timeout: TIMEOUT, status: () => lastLoad?.status || 'idle' };
+})(_0x1c5250, _0x36259b, _0x432e89, _0x1221a3);
+// AUTOBI_CLOUD_CONFIGURATION_END
 
 // AUTOBI_LICENSE_START
 (function installLicense(auth, data, ui, app, utils, constants, setAuthState) {
