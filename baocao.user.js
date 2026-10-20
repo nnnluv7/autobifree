@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.7.10
+// @version      1.8.0
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
