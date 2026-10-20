@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AutoBiFree
 // @namespace    http://tampermonkey.net/
-// @version      1.7.9
+// @version      1.7.10
 // @description  Báo Cáo Kinh Doanh
 // @author       AeNhaQuang
 // @match        https://crm.thegioididong.com/*
@@ -3045,11 +3045,15 @@ _0x1c5250.metricAudit.installScopeCapture();
         return { expiresAt, expireDays: Math.ceil((expiresAt - Date.now()) / DAY) - 1 };
     }
     function decision(source, id) {
-        const rows = csvRows(source), headers = (rows.shift() || []).map(slug);
+        // Accept the explanatory captions shown in the setup instructions,
+        // e.g. "Cho phép — TRUE/FALSE" and "Ngày hết hạn — có thể để trống".
+        const header = value => slug(String(value || '').split(/\s*[—–]\s*|\s+-\s+|\s*[(（]|\r?\n/, 1)[0]);
+        const rows = csvRows(source), headers = (rows.shift() || []).map(header);
         const ids = headers.flatMap((header, index) => /^(msnv|manhanvien|manguoidung|userid|crmid|usercrm|taikhoan|username|nguoidung|user|nhanvien)$/.test(header) ? [index] : []);
-        const permission = headers.findIndex(header => /^(chophep|quyen|capquyen|banquyen|kichhoat|trangthai|active|allowed|enabled|enable|permission)$/.test(header));
-        const date = headers.findIndex(header => /^(ngayhethan|hethan|handung|ngayhethanbanquyen|expiry|expires|expirydate|expiredate|expiresat|songayconlai|songay|expiredays)$/.test(header));
-        if (!ids.length || permission < 0) throw new Error('license_headers');
+        const permissions = headers.flatMap((header, index) => /^(chophep|quyen|capquyen|banquyen|kichhoat|trangthai|active|allowed|enabled|enable|permission)$/.test(header) ? [index] : []);
+        const dates = headers.flatMap((header, index) => /^(ngayhethan|hethan|handung|ngayhethanbanquyen|expiry|expires|expirydate|expiredate|expiresat|songayconlai|songay|expiredays)$/.test(header) ? [index] : []);
+        if (!ids.length || permissions.length !== 1 || dates.length > 1) throw new Error('license_headers');
+        const permission = permissions[0], date = dates[0] ?? -1;
         const matches = rows.filter(row => ids.some(index => userId(row[index]) === id));
         if (!matches.length) return { isAuthorized: false, expiresAt: null, expireDays: null };
         const results = matches.map(row => {
@@ -3222,7 +3226,7 @@ _0x1c5250.metricAudit.installScopeCapture();
     setInterval(() => { reconcile(); check(null, { force: true }); }, MINUTE);
     data.license = { sheetId: SHEET, gid: GID, cacheKey: CACHE, identityKey: IDENTITY, grace: GRACE, userId, profile, decision, state, check, reconcile, refresh: () => check(null, { force: true }) };
     reconcile();
-    check();
+    check(null, { force: true });
 })(_0x2aa741, _0x1c5250, _0x432e89, _0x565350, _0x36259b, _0x1221a3, state => { _0x4dbbf5 = state; });
 // AUTOBI_LICENSE_END
 
